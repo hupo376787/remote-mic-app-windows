@@ -1530,7 +1530,11 @@ mod ime_target_tests {
     /// NotRequired，不碰 TSF（2026-09-29 真机回归过"豆包路径被切成微信"）。
     #[test]
     fn vokie_and_other_do_not_touch_input_methods() {
-        for tool in [VoiceInputTool::Vokie, VoiceInputTool::Other, VoiceInputTool::WindowsTyping] {
+        for tool in [
+            VoiceInputTool::Vokie,
+            VoiceInputTool::Other,
+            VoiceInputTool::WindowsTyping,
+        ] {
             assert_eq!(
                 super::ensure_session_ime(tool, super::ImeSwitchScope::VoicePress),
                 Ok(super::ImeActivation::NotRequired)
