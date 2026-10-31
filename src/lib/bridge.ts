@@ -705,6 +705,17 @@ export async function setLaunchAtLogin(enabled: boolean): Promise<boolean> {
   return invoke<boolean>("set_launch_at_login", { enabled });
 }
 
+/** 仅 Windows 登录自启动隐藏主窗口；手动启动、托盘点击不受影响。 */
+export async function getSilentLaunchAtLogin(): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  return invoke<boolean>("get_silent_launch_at_login");
+}
+
+export async function setSilentLaunchAtLogin(enabled: boolean): Promise<boolean> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法设置开机静默启动");
+  return invoke<boolean>("set_silent_launch_at_login", { enabled });
+}
+
 /**
  * 「启动时自动打开主面板」（设置页「启动行为」，对齐 Mac `openMainWindowAtLaunch`）。
  *
