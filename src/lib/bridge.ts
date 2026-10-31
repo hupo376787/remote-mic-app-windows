@@ -1766,7 +1766,7 @@ export async function setVoiceHoldHotkey(hotkey: KeyChord | null): Promise<KeyCh
  * 输入工具"开关）；真正生效的语音路径永远是"按住说话快捷键"本身。
  * `null` = 用户从未选择过（老配置）：界面按当前快捷键推断一次后落存。
  */
-export type VoiceInputTool = "wechat" | "doubao" | "vokie" | "other";
+export type VoiceInputTool = "wechat" | "doubao" | "vokie" | "other" | "windows_typing";
 
 export async function getVoiceInputTool(): Promise<VoiceInputTool | null> {
   if (!isTauriRuntime()) {
