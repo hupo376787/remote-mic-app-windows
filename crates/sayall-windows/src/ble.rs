@@ -16,7 +16,7 @@ use crate::{
 use sayall_core::settings::VoiceInputTool;
 use sayall_core::{AtvvCommand, AtvvVoicePipeline, PipelineOutput, VoiceSessionState};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, Receiver, Sender},
     Arc, Mutex, MutexGuard, OnceLock,
 };
@@ -105,6 +105,40 @@ fn press_path(synth_gate: bool, has_hotkey: bool) -> &'static str {
     } else {
         "none"
     }
+}
+
+/// Windows 自带语音键入是切换式 Win+H，而不是可保持的热键。
+/// 仅在本应用实际注入成功后标记活动；正常结束在音频排空后尝试再次
+/// Win+H 暂停，异常/睡眠/断连/退出通过统一清理立即尝试暂停。
+/// Windows 没有承诺 Win+H 是可靠的「停止」API，必须在真机验证。
+static WINDOWS_TYPING_OWNED: AtomicBool = AtomicBool::new(false);
+
+fn windows_typing_chord() -> KeyChord {
+    KeyChord { keys: vec![KeyCode::LeftWindows, KeyCode::H] }
+}
+
+fn start_windows_typing(send_input: &SendInputRuntime) -> Result<(), PlatformError> {
+    if WINDOWS_TYPING_OWNED.load(Ordering::SeqCst) {
+        gatt_note("windows_typing phase=start result=skipped reason=already_owned".to_owned());
+        return Ok(());
+    }
+    send_input.tap(windows_typing_chord())?;
+    WINDOWS_TYPING_OWNED.store(true, Ordering::SeqCst);
+    gatt_note("windows_typing phase=start result=submitted method=win_h".to_owned());
+    Ok(())
+}
+
+fn stop_windows_typing(send_input: &SendInputRuntime, reason: &str) {
+    if !WINDOWS_TYPING_OWNED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    // Win+H 在已打开听写面板时通常切换聆听状态，但微软只正式保证
+    // 点击麦克风/语音指令停止；不发送 Escape，以免关闭用户应用的对话框。
+    let result = send_input.tap(windows_typing_chord());
+    gatt_note(format!(
+        "windows_typing phase=stop result={} method=win_h_toggle reason={reason} verified=false",
+        if result.is_ok() { "submitted" } else { "failed" }
+    ));
 }
 
 /// 报告层合成目标标签（日志 `synth=`）：`off` 或具体 HID usage。
@@ -2597,7 +2631,18 @@ fn handle_control(
                     "voice_path fallback session={session_id} tool=doubao reason=report_layer_inactive note=tool_ignores_injected_keys"
                 ));
             }
-            if synth_gate {
+            if attempt_tool == Some(VoiceInputTool::WindowsTyping) {
+                // 与持有式快捷键互斥：Windows 听写用 Win+H 切换一次，
+                // 不能把 Win 键保持到松开，否则会污染语音期间的正常输入。
+                if let Err(error) = start_windows_typing(send_input) {
+                    abort_voice_session(
+                        session, pipeline, state, audio, send_input, held_hotkey,
+                        active_voice_samples, Some(session_id),
+                        format!("启动 Windows 语音输入失败：{error}"), usage,
+                    );
+                    return;
+                }
+            } else if synth_gate {
                 // 生效判据的按下时刻与基线：必须在此刻取——IME 切换等后续动作可能耗时，
                 // 之后取会把期间到达的帧证据误算进基线（见 spawn_voice_effect_check）。
                 let effect_press_at = Instant::now();
@@ -2754,8 +2799,9 @@ fn handle_control(
             // 会话结束：取消 MIC_EXTEND 续期节拍（中止路径的过期节拍会在触发时
             // 自行检查会话状态并清除，无需逐处清理）。
             *extend_deadline = None;
-            // 松手统一释放：无论音频排空是否成功，先释放按住的快捷键。
-            release_voice_hold_hotkey(send_input, held_hotkey);
+            // 第三方输入法按住式热键需立即释放；Windows Win+H 则须等
+            // 音频排空后再停止，防止语句尾部音频还没有写进 VB-CABLE。
+            release_voice_hold_hotkey_only(send_input, held_hotkey);
             {
                 let mut snapshot = lock(state);
                 snapshot.phase = ConnectionPhase::Draining;
@@ -2778,9 +2824,11 @@ fn handle_control(
                 return;
             }
             if let Err(error) = pipeline.complete_drain(generation) {
+                stop_windows_typing(send_input, "drain_failed");
                 lock(state).last_error = Some(error.to_string());
                 return;
             }
+            stop_windows_typing(send_input, "released_after_drain");
             let duration_ms = voice_stream_started_at
                 .take()
                 .map(|started| started.elapsed().as_millis() as u64)
@@ -3013,6 +3061,11 @@ fn abort_voice_session(
 /// 释放失败会记录在 SendInput 快照的 last_error 中，由诊断摘要呈现。
 /// 同时解除语音键 F5 抑制器的会话武装（覆盖停止/中止/断连/退出全部路径）。
 fn release_voice_hold_hotkey(send_input: &SendInputRuntime, held_hotkey: &mut Option<KeyChord>) {
+    release_voice_hold_hotkey_only(send_input, held_hotkey);
+    stop_windows_typing(send_input, "cleanup");
+}
+
+fn release_voice_hold_hotkey_only(send_input: &SendInputRuntime, held_hotkey: &mut Option<KeyChord>) {
     crate::key_suppressor::set_session_active(false);
     if let Some(chord) = held_hotkey.take() {
         // 功能点日志：释放结果（与 chord_press 成对，粘键排查的另一半）。
