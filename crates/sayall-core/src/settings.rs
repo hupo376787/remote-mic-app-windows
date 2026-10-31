@@ -108,6 +108,9 @@ pub struct AppSettings {
     /// 连接页选择的输入工具（微信输入法 / 豆包输入法 / 其他工具）。
     pub voice_input_tool: Option<VoiceInputTool>,
     pub launch_at_login: bool,
+    /// 只对 Windows 登录启动项生效：登录后只在托盘驻留，手动启动仍按普通窗口设置。
+    /// 老用户默认关闭，避免升级后无提示地隐藏主界面。
+    pub silent_launch_at_login: bool,
     /// 启动时是否自动打开主面板（设置页「启动行为」第二项，默认 **开启**）。
     ///
     /// 对齐 Mac `AppSettings.openMainWindowAtLaunch`：关闭后普通启动只驻留托盘，
@@ -173,6 +176,7 @@ impl Default for AppSettings {
             voice_trigger_mode: VoiceTriggerMode::Hold,
             voice_input_tool: None,
             launch_at_login: false,
+            silent_launch_at_login: false,
             open_window_at_launch: true,
             check_prerelease_updates: false,
             rc003_capture_enabled: false,
@@ -423,6 +427,22 @@ mod tests {
         .unwrap();
         assert_eq!(settings.app_icon, AppIconIdentifier::Standard);
         assert_eq!(settings.gain_db, 12.0);
+    }
+
+    #[test]
+    fn silent_launch_at_login_defaults_off_and_round_trips() {
+        assert!(!AppSettings::default().silent_launch_at_login);
+        let old: AppSettings =
+            serde_json::from_str(r#"{"schema_version":4,"launch_at_login":true}"#).unwrap();
+        assert!(!old.silent_launch_at_login);
+        let enabled = AppSettings {
+            silent_launch_at_login: true,
+            ..AppSettings::default()
+        };
+        let encoded = serde_json::to_string(&enabled).unwrap();
+        assert!(encoded.contains("\"silent_launch_at_login\":true"));
+        let restored: AppSettings = serde_json::from_str(&encoded).unwrap();
+        assert!(restored.normalized().silent_launch_at_login);
     }
 
     /// 「启动时自动打开主面板」（设置页「启动行为」，2026-10-19 用户定稿）。

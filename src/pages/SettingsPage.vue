@@ -9,12 +9,14 @@ import type {
 import {
   getAppIcon,
   getLaunchAtLogin,
+  getSilentLaunchAtLogin,
   getOpenWindowAtLaunch,
   openGitHubRepository,
   openOfficialWebsite,
   restartOnboarding,
   setAppIcon,
   setLaunchAtLogin,
+  setSilentLaunchAtLogin,
   setOpenWindowAtLaunch,
 } from "../lib/bridge";
 import { appUpdateProgressText, useAppUpdate } from "../lib/app-update";
@@ -133,6 +135,12 @@ const launchAtLogin = ref(false);
 const launchAtLoginReady = ref(false);
 const launchAtLoginBusy = ref(false);
 const launchAtLoginError = ref("");
+
+// 开机静默仅在 Windows Run 登录启动时生效，不影响手动启动和托盘恢复。
+const silentLaunchAtLogin = ref(false);
+const silentLaunchAtLoginReady = ref(false);
+const silentLaunchAtLoginBusy = ref(false);
+const silentLaunchAtLoginError = ref("");
 
 /**
  * 「启动时自动打开主面板」（2026-10-19，对齐 Mac `openMainWindowAtLaunch`）。
@@ -256,6 +264,25 @@ async function onLaunchAtLoginChange(event: Event): Promise<void> {
   }
 }
 
+async function onSilentLaunchAtLoginChange(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  if (!launchAtLogin.value) {
+    input.checked = silentLaunchAtLogin.value;
+    return;
+  }
+  silentLaunchAtLoginBusy.value = true;
+  silentLaunchAtLoginError.value = "";
+  try {
+    silentLaunchAtLogin.value = await setSilentLaunchAtLogin(input.checked);
+  } catch (error) {
+    console.warn(`silent login startup update failed: ${error instanceof Error ? error.message : String(error)}`);
+    silentLaunchAtLoginError.value = "无法保存开机静默启动设置，请稍后重试。";
+    input.checked = silentLaunchAtLogin.value;
+  } finally {
+    silentLaunchAtLoginBusy.value = false;
+  }
+}
+
 async function onOpenWindowAtLaunchChange(event: Event): Promise<void> {
   const input = event.target as HTMLInputElement;
   const enabled = input.checked;
@@ -309,6 +336,13 @@ onMounted(() => {
     // 就绪标志与初值在同一渲染批次生效：开关此时才被创建，创建即带正确
     // checked，不产生属性变更，故无过渡可触发（无需禁用过渡或等待绘制）。
     .finally(() => { launchAtLoginReady.value = true; });
+  void getSilentLaunchAtLogin()
+    .then((enabled) => { silentLaunchAtLogin.value = enabled; })
+    .catch((error) => {
+      console.warn(`read silent login startup failed: ${error instanceof Error ? error.message : String(error)}`);
+      silentLaunchAtLoginError.value = "无法读取开机静默启动设置，请稍后重试。";
+    })
+    .finally(() => { silentLaunchAtLoginReady.value = true; });
   void getOpenWindowAtLaunch()
     .then((enabled) => { openWindowAtLaunch.value = enabled; })
     .catch((error) => {
@@ -548,6 +582,23 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
             <span class="launch-toggle-divider" aria-hidden="true"></span>
             <label
               class="toggle-row launch-toggle"
+              :title="t('仅通过 Windows 登录启动时隐藏主界面，后台功能正常运行；手动双击和点击托盘仍可打开。')"
+            >
+              <span>{{ t("开机静默启动（仅托盘）") }}</span>
+              <input
+                v-if="silentLaunchAtLoginReady"
+                type="checkbox"
+                class="toggle-input"
+                name="silent-launch-at-login"
+                :checked="silentLaunchAtLogin"
+                :disabled="silentLaunchAtLoginBusy || launchAtLoginBusy || !launchAtLogin"
+                @change="onSilentLaunchAtLoginChange"
+              />
+              <span v-else class="toggle-placeholder" aria-hidden="true"></span>
+            </label>
+            <span class="launch-toggle-divider" aria-hidden="true"></span>
+            <label
+              class="toggle-row launch-toggle"
               :title="t('关闭后普通启动仅保留托盘入口；更新完成后仍会显示主面板。')"
             >
               <span>{{ t("启动时自动打开主面板") }}</span>
@@ -569,6 +620,9 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
         </p>
         <p v-if="openWindowAtLaunchError" class="error-text" role="alert">
           {{ t(openWindowAtLaunchError) }}
+        </p>
+        <p v-if="silentLaunchAtLoginError" class="error-text" role="alert">
+          {{ t(silentLaunchAtLoginError) }}
         </p>
 
         <div class="settings-row">
