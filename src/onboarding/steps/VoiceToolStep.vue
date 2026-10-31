@@ -40,6 +40,11 @@ const TOOL_CARDS = computed<Array<{ id: VoiceInputTool; title: string; blurb: st
     blurb: t("按住遥控器语音键 = 左 Ctrl + 左 Win"),
   },
   { id: "vokie", title: "Vokie", blurb: t("按住遥控器语音键 = 右 Alt") },
+  {
+    id: "windows_typing",
+    title: t("Windows 自带语音输入"),
+    blurb: t("使用 Win + H，无需第三方输入法"),
+  },
   { id: "other", title: t("其他工具"), blurb: t("自己选一个语音键") },
 ]);
 
@@ -178,6 +183,12 @@ function isOtherKeySelected(keys: KeyCode[]): boolean {
         </div>
       </template>
       <p class="onboarding-muted">{{ t("在 Vokie 里把麦克风选为 CABLE Output，快捷键保持右 Alt。") }}</p>
+    </div>
+
+    <div v-else-if="tool === 'windows_typing'" class="onboarding-card">
+      <h4>{{ t("按住遥控器语音键") }} = Win + H <span class="onboarding-tag">{{ t("本次设置") }}</span></h4>
+      <p>{{ t("按下自动启动 Windows 语音输入；松开后先排空音频，再尝试暂停。Windows 未提供稳定的停止快捷键，若仍在聆听，请点击语音面板麦克风按钮。") }}</p>
+      <p class="onboarding-muted">{{ t("Windows 语音输入的麦克风选 CABLE Output") }}</p>
     </div>
 
     <div v-else-if="tool === 'other'" class="onboarding-card">
