@@ -429,11 +429,33 @@ describe("VB-CABLE first-launch guidance", () => {
     await flushPromises();
 
     const order = wrapper.findAll(".tool-card strong").map((node) => node.text());
-    expect(order).toEqual(["豆包输入法", "微信输入法", "Vokie", "其他工具"]);
+    expect(order).toEqual(["豆包输入法", "微信输入法", "Vokie", "Windows 自带语音输入", "其他工具"]);
     expect(selectedToolCard(wrapper)).toBe("微信输入法");
     // 微信不需要"支持更多输入工具"开关，面板不渲染它。
     expect(wrapper.find(".capture-switch").exists()).toBe(false);
     expect(wrapper.text()).toContain("微信输入法不需要“支持更多输入工具”开关");
+    wrapper.unmount();
+  });
+
+  it("Windows 自带语音输入：切换工具后清空原来持有的快捷键并显示 Win+H 指引", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    await wrapper
+      .findAll(".tool-card")
+      .find((card) => card.text().includes("Windows 自带语音输入"))!
+      .trigger("click");
+    await flushPromises();
+
+    expect(mocks.setVoiceInputTool).toHaveBeenCalledWith("windows_typing");
+    expect(mocks.setVoiceHoldHotkey).toHaveBeenCalledWith(null);
+    expect(selectedToolCard(wrapper)).toBe("Windows 自带语音输入");
+    expect(wrapper.find(".setup-col:nth-child(2)").text()).toContain("Win + H");
+    expect(wrapper.findAll(".checklist li").map((item) => item.text())).toEqual([
+      "1Windows 语音输入的麦克风选 CABLE Output",
+      "2在文本框中按住遥控器语音键说话",
+      "3松开后确认听写已暂停；若没有暂停，请点击系统语音面板的麦克风",
+    ]);
     wrapper.unmount();
   });
 

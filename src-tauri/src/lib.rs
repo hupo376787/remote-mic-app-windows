@@ -4197,6 +4197,7 @@ pub(crate) fn voice_input_tool_name(tool: Option<VoiceInputTool>) -> &'static st
         Some(VoiceInputTool::Doubao) => "doubao",
         Some(VoiceInputTool::Vokie) => "vokie",
         Some(VoiceInputTool::Other) => "other",
+        Some(VoiceInputTool::WindowsTyping) => "windows_typing",
         None => "unset",
     }
 }
