@@ -23,11 +23,18 @@ SayAll -> VB-CABLE 播放端 -> CABLE Output 录音端把声音送入 Windows；
 
 - **启动**：记事本有文本焦点；按住遥控器语音键，观察 Win+H 面板出现并进入聆听；
   输入内容应来自 CABLE Output，而不是物理麦克风。
-- **收尾**：松开语音键后 SayAll 先排空音频，再尝试再次发送 Win+H；
-  观察面板是否停止聆听、末尾文字是否完整。若还在聆听，点击 Windows 面板麦克风暂停。
+- **启动预热**：按下语音键后，SayAll 先向 CABLE 播放约 900ms 静音，
+  再输出缓冲的真实语音。立刻说话的开头不得被 Windows 面板启动耗时吃掉。
+- **识别收尾**：松开语音键后，SayAll 在真实语音后向 CABLE 输出约 1800ms 静音，
+  让 Windows 检测句尾并提交结果，然后才尝试再次发送 Win+H 停止。
+  检查文字是否出现、末尾有没有丢字。不要把“音频已经排空”当成“云端已经识别完成”。
+  如果仍在聆听，请点击 Windows 面板麦克风暂停。
 - **二次按住**：上次已暂停时再次按住应重新开始听写；应无意外 Win 键粘连。
 - **快速点按、长按、连续多轮**：不应多次启动 / 关闭；记录 `windows_typing`
-  的 start/stop 日志以及实际 Windows 面板状态。
+  的 start/preroll/postroll/stop 日志以及实际 Windows 面板状态。
+  建议至少测试（a）按下立刻说一句 2 秒中文，（b）按下后等 1 秒再说，
+  （c）连续说 8 秒，（d）只有 0.5 秒语音；
+  识别失败时同时对照手动 Win+H 录入以及“窗口已聆听但尚未识别”的状态。
 - **异常**：连接中断、休眠、退出、重新配置等路径会尝试清理本应用启动的听写，
   不应留下键盘按下状态。重连后应可正常输入。
 - **兼容**：返回豆包、微信、Vokie / 其他工具，原来快捷键和语音路径应正常；
@@ -50,7 +57,9 @@ SayAll -> VB-CABLE 播放端 -> CABLE Output 录音端把声音送入 Windows；
 ## 验收状态
 
 - 静态代码和配置语义可检查。
-- **Windows 真机自动启停：deferred（待 RC001 / RC003 实机验证）**。
+- **用户现场原版问题**：RC003 按住可打开、松开可停止 Windows 听写，但无识别文字；
+  新增静音前/后缓冲用于验证启动晚和停得早的问题，目前尚未在真机复测。
+- **Windows 真机自动启停及文字识别：deferred（待 RC001 / RC003 实机验证）**。
 - **Win+H 停止效果：deferred；没有官方接口保证**。
 
 微软支持文档：https://support.microsoft.com/en-us/accessibility/windows/use-voice-typing-to-talk-instead-of-type-on-your-pc
