@@ -34,6 +34,8 @@ const setLanguagePreference = vi.fn<
 const bridge = vi.hoisted(() => ({
   getLaunchAtLogin: vi.fn<() => Promise<boolean>>(),
   setLaunchAtLogin: vi.fn<(enabled: boolean) => Promise<boolean>>(),
+  getSilentLaunchAtLogin: vi.fn<() => Promise<boolean>>(),
+  setSilentLaunchAtLogin: vi.fn<(enabled: boolean) => Promise<boolean>>(),
   getOpenWindowAtLaunch: vi.fn<() => Promise<boolean>>(),
   setOpenWindowAtLaunch: vi.fn<(enabled: boolean) => Promise<boolean>>(),
   getAppIcon: vi.fn<() => Promise<"standard" | "faceted-duck">>(),
@@ -176,6 +178,8 @@ describe("settings page", () => {
     setLanguagePreference.mockReset();
     bridge.getLaunchAtLogin.mockReset().mockResolvedValue(false);
     bridge.setLaunchAtLogin.mockReset();
+    bridge.getSilentLaunchAtLogin.mockReset().mockResolvedValue(false);
+    bridge.setSilentLaunchAtLogin.mockReset();
     // 「启动时自动打开主面板」新装默认开启（与 Rust `AppSettings::default()` 同源）。
     bridge.getOpenWindowAtLaunch.mockReset().mockResolvedValue(true);
     bridge.setOpenWindowAtLaunch.mockReset();
@@ -283,6 +287,9 @@ describe("settings page", () => {
       launch.find('input[name="launch-at-login"]').element,
     );
 
+    const silent = wrapper.get('input[name="silent-launch-at-login"]');
+    expect(silent.element.closest("label")?.textContent).toContain("开机静默启动（仅托盘）");
+
     // 通用「启动时自动打开主面板」：同样文字在前、开关在后。
     const openWindow = wrapper.get('label[title*="更新完成后仍会显示主面板"]');
     expect((openWindow.element.firstElementChild as HTMLElement).textContent).toContain(
@@ -293,7 +300,7 @@ describe("settings page", () => {
     );
   });
 
-  it("启动行为两项并排、文字在上开关在下，中间一条竖分隔线（对齐 Mac）", async () => {
+  it("启动行为三项并排，两个分隔线保持开关在右侧", async () => {
     const wrapper = mount(SettingsPage, { props: { runtime } });
     await flushPromises();
 
@@ -307,8 +314,10 @@ describe("settings page", () => {
       "toggle-row launch-toggle",
       "launch-toggle-divider",
       "toggle-row launch-toggle",
+      "launch-toggle-divider",
+      "toggle-row launch-toggle",
     ]);
-    expect(toggles.findAll(".launch-toggle")).toHaveLength(2);
+    expect(toggles.findAll(".launch-toggle")).toHaveLength(3);
     expect(toggles.get(".launch-toggle-divider").attributes("aria-hidden")).toBe("true");
   });
 
@@ -324,6 +333,44 @@ describe("settings page", () => {
     expect(
       wrapper.get('label[title*="更新完成后仍会显示主面板"]').attributes("title"),
     ).toBe("关闭后普通启动仅保留托盘入口；更新完成后仍会显示主面板。");
+  });
+
+  it("开机静默启动独立于普通启动，需先启用登录自启动", async () => {
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    await flushPromises();
+    const silent = wrapper.get<HTMLInputElement>('input[name="silent-launch-at-login"]');
+    const normal = wrapper.get<HTMLInputElement>('input[name="open-window-at-launch"]');
+    expect(silent.element.checked).toBe(false);
+    expect(silent.element.disabled).toBe(true);
+    expect(normal.element.checked).toBe(true);
+
+    // 启用登录自启动，不应修改普通启动是否显示主面板。
+    bridge.setLaunchAtLogin.mockResolvedValue(true);
+    await wrapper.get<HTMLInputElement>('input[name="launch-at-login"]').setValue(true);
+    await flushPromises();
+    expect(silent.element.disabled).toBe(false);
+
+    bridge.setSilentLaunchAtLogin.mockResolvedValue(true);
+    await silent.setValue(true);
+    await flushPromises();
+    expect(bridge.setSilentLaunchAtLogin).toHaveBeenCalledWith(true);
+    expect(silent.element.checked).toBe(true);
+    expect(normal.element.checked).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("开机静默设置保存失败时回滚开关显示状态", async () => {
+    bridge.getLaunchAtLogin.mockResolvedValue(true);
+    bridge.setSilentLaunchAtLogin.mockRejectedValue(new Error("write failed"));
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    await flushPromises();
+
+    const silent = wrapper.get<HTMLInputElement>('input[name="silent-launch-at-login"]');
+    await silent.setValue(true);
+    await flushPromises();
+    expect(silent.element.checked).toBe(false);
+    expect(wrapper.text()).toContain("无法保存开机静默启动设置");
+    wrapper.unmount();
   });
 
   it("启动时自动打开主面板默认开启，切换后保存并回显返回值", async () => {
