@@ -182,8 +182,14 @@ mod windows_typing_audio_timing_tests {
         assert_eq!(WINDOWS_TYPING_PREROLL_SAMPLES, 14_400);
         assert_eq!(WINDOWS_TYPING_POSTROLL_SAMPLES, 28_800);
         // Silence is delivered to Windows but not counted as remote audio.
-        assert_eq!(WINDOWS_TYPING_PREROLL_SAMPLES * 1000 / WINDOWS_TYPING_PCM_RATE, 900);
-        assert_eq!(WINDOWS_TYPING_POSTROLL_SAMPLES * 1000 / WINDOWS_TYPING_PCM_RATE, 1800);
+        assert_eq!(
+            WINDOWS_TYPING_PREROLL_SAMPLES * 1000 / WINDOWS_TYPING_PCM_RATE,
+            900
+        );
+        assert_eq!(
+            WINDOWS_TYPING_POSTROLL_SAMPLES * 1000 / WINDOWS_TYPING_PCM_RATE,
+            1800
+        );
     }
 }
 
