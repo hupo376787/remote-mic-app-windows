@@ -114,12 +114,16 @@ fn press_path(synth_gate: bool, has_hotkey: bool) -> &'static str {
 static WINDOWS_TYPING_OWNED: AtomicBool = AtomicBool::new(false);
 
 fn windows_typing_chord() -> KeyChord {
-    KeyChord { keys: vec![KeyCode::LeftWindows, KeyCode::H] }
+    KeyChord {
+        keys: vec![KeyCode::LeftWindows, KeyCode::H],
+    }
 }
 
 fn start_windows_typing(send_input: &SendInputRuntime) -> Result<(), PlatformError> {
     if WINDOWS_TYPING_OWNED.load(Ordering::SeqCst) {
-        gatt_note("windows_typing phase=start result=skipped reason=already_owned".to_owned());
+        gatt_note(
+            "windows_typing phase=start result=skipped reason=already_owned".to_owned(),
+        );
         return Ok(());
     }
     send_input.tap(windows_typing_chord())?;
@@ -2640,9 +2644,16 @@ fn handle_control(
                 // 不能把 Win 键保持到松开，否则会污染语音期间的正常输入。
                 if let Err(error) = start_windows_typing(send_input) {
                     abort_voice_session(
-                        session, pipeline, state, audio, send_input, held_hotkey,
-                        active_voice_samples, Some(session_id),
-                        format!("启动 Windows 语音输入失败：{error}"), usage,
+                        session,
+                        pipeline,
+                        state,
+                        audio,
+                        send_input,
+                        held_hotkey,
+                        active_voice_samples,
+                        Some(session_id),
+                        format!("启动 Windows 语音输入失败：{error}"),
+                        usage,
                     );
                     return;
                 }
@@ -3069,7 +3080,10 @@ fn release_voice_hold_hotkey(send_input: &SendInputRuntime, held_hotkey: &mut Op
     stop_windows_typing(send_input, "cleanup");
 }
 
-fn release_voice_hold_hotkey_only(send_input: &SendInputRuntime, held_hotkey: &mut Option<KeyChord>) {
+fn release_voice_hold_hotkey_only(
+    send_input: &SendInputRuntime,
+    held_hotkey: &mut Option<KeyChord>,
+) {
     crate::key_suppressor::set_session_active(false);
     if let Some(chord) = held_hotkey.take() {
         // 功能点日志：释放结果（与 chord_press 成对，粘键排查的另一半）。
