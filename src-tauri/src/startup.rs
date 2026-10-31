@@ -211,7 +211,9 @@ mod windows_impl {
 
     #[cfg(test)]
     mod tests {
-        use super::{command_target, command_targets_executable, paths_equal, LOGIN_START_ARGUMENT};
+        use super::{
+            command_target, command_targets_executable, paths_equal, LOGIN_START_ARGUMENT,
+        };
         use std::path::Path;
 
         #[test]
