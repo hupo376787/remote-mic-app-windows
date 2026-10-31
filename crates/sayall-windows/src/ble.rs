@@ -121,9 +121,7 @@ fn windows_typing_chord() -> KeyChord {
 
 fn start_windows_typing(send_input: &SendInputRuntime) -> Result<(), PlatformError> {
     if WINDOWS_TYPING_OWNED.load(Ordering::SeqCst) {
-        gatt_note(
-            "windows_typing phase=start result=skipped reason=already_owned".to_owned(),
-        );
+        gatt_note("windows_typing phase=start result=skipped reason=already_owned".to_owned());
         return Ok(());
     }
     send_input.tap(windows_typing_chord())?;
@@ -141,7 +139,11 @@ fn stop_windows_typing(send_input: &SendInputRuntime, reason: &str) {
     let result = send_input.tap(windows_typing_chord());
     gatt_note(format!(
         "windows_typing phase=stop result={} method=win_h_toggle reason={reason} verified=false",
-        if result.is_ok() { "submitted" } else { "failed" }
+        if result.is_ok() {
+            "submitted"
+        } else {
+            "failed"
+        }
     ));
 }
 
