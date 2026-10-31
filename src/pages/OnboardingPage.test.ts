@@ -1387,6 +1387,19 @@ describe("Onboarding input tool step", () => {
     expect(continueButton.attributes("data-gate-ready")).toBe("true");
   });
 
+  it("Windows 自带语音输入在向导里可选，清空保持式热键并显示 Win+H", async () => {
+    const wrapper = await mountToolStep();
+
+    await toolCard(wrapper, "Windows 自带语音输入").trigger("click");
+    await flushPromises();
+
+    expect(mocks.stageOnboardingVoiceBinding).toHaveBeenCalledWith("windows_typing", null);
+    expect(wrapper.find(".onboarding-actions .primary-button").attributes("data-gate-ready")).toBe("true");
+    expect(wrapper.text()).toContain("Win + H");
+    expect(wrapper.text()).toContain("Windows 语音输入的麦克风选 CABLE Output");
+    wrapper.unmount();
+  });
+
   it("treats 微信输入法 as immediately satisfied on the wizard side", async () => {
     const wrapper = await mountToolStep();
 
