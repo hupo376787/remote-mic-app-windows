@@ -4571,7 +4571,9 @@ async fn set_open_window_at_launch(
 async fn get_silent_launch_at_login(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     let settings = state.settings.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        settings.load().map(|settings| settings.silent_launch_at_login)
+        settings
+            .load()
+            .map(|settings| settings.silent_launch_at_login)
     })
     .await
     .map_err(|error| format!("读取开机静默启动设置任务失败：{error}"))?
@@ -6422,13 +6424,23 @@ mod tests {
     fn startup_visibility_follows_onboarding_and_preference() {
         // 以前的启动策略仍然适用于手动双击和普通自启。
         assert!(should_show_main_window_on_startup(true, false, true, false));
-        assert!(should_show_main_window_on_startup(true, false, false, false));
+        assert!(should_show_main_window_on_startup(
+            true, false, false, false
+        ));
         assert!(should_show_main_window_on_startup(true, true, false, false));
-        assert!(should_show_main_window_on_startup(false, false, true, false));
-        assert!(!should_show_main_window_on_startup(false, false, false, false));
-        assert!(should_show_main_window_on_startup(false, true, false, false));
+        assert!(should_show_main_window_on_startup(
+            false, false, true, false
+        ));
+        assert!(!should_show_main_window_on_startup(
+            false, false, false, false
+        ));
+        assert!(should_show_main_window_on_startup(
+            false, true, false, false
+        ));
         // 登录静默启动：即使普通启动开主界面、正在更新或向导中，也不闪出窗口。
-        assert!(!should_show_main_window_on_startup(false, false, true, true));
+        assert!(!should_show_main_window_on_startup(
+            false, false, true, true
+        ));
         assert!(!should_show_main_window_on_startup(true, false, true, true));
         assert!(!should_show_main_window_on_startup(false, true, true, true));
     }
