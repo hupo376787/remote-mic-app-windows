@@ -81,6 +81,12 @@ impl SettingsStore {
         })
     }
 
+    pub fn save_silent_launch_at_login(&self, enabled: bool) -> Result<(), String> {
+        self.update("保存开机静默启动设置", move |settings| {
+            settings.silent_launch_at_login = enabled;
+        })
+    }
+
     /// 启动时是否自动打开主面板（设置页「启动行为」第二项，默认开启）。
     ///
     /// 对齐 Mac `openMainWindowAtLaunch`：关闭后普通启动只驻留托盘，托盘菜单、
