@@ -193,6 +193,7 @@ const VOICE_TOOL_CHORDS: Record<VoiceInputTool, KeyCode[] | null> = {
   wechat: [...DEFAULT_VOICE_HOTKEY_KEYS],
   vokie: ["right_alt"],
   other: null,
+  windows_typing: null,
 };
 
 /** 工具卡片顺序：豆包第一（2026-09-30 Andy 要求），Vokie 在“其他工具”之前（2026-10-01 新增）。 */
@@ -200,6 +201,7 @@ const TOOL_CARDS: Array<{ id: VoiceInputTool; name: string; note: string }> = [
   { id: "doubao", name: "豆包输入法", note: "要开启“支持更多输入工具”" },
   { id: "wechat", name: "微信输入法", note: "用默认语音键，最省事" },
   { id: "vokie", name: "Vokie", note: "流式显示，智能整理，不占用输入法" },
+  { id: "windows_typing", name: "Windows 自带语音输入", note: "使用 Win + H，无需第三方输入法" },
   { id: "other", name: "其他工具", note: "自己指定按键" },
 ];
 
@@ -298,6 +300,9 @@ async function selectVoiceInputTool(tool: VoiceInputTool): Promise<void> {
   try {
     if (keys) {
       await applyVoiceHotkey([...keys]);
+    } else if (tool === "windows_typing") {
+      // Windows 自带听写单独执行 Win+H，不能遗留上一个工具的保持式快捷键。
+      await applyVoiceHotkey([]);
     } else if (tool === "other") {
       // 「其他工具」有自己的记忆：切去豆包/微信会改写"按住说话快捷键"，
       // 切回来时按用户上次选的恢复（never = 从未选过 → 保持现状）。
@@ -1388,7 +1393,7 @@ onUnmounted(() => {
       <div class="card-title-row">
         <div>
           <h2>{{ t("语音输入设置") }}</h2>
-          <p class="muted">{{ t("设置一次，之后按住遥控器语音键说话，松开就出字。") }}</p>
+          <p class="muted">{{ voiceInputTool === "windows_typing" ? t("按住遥控器语音键启动 Windows 听写；松开后尝试暂停，最终文字可能稍后出现。") : t("设置一次，之后按住遥控器语音键说话，松开就出字。") }}</p>
         </div>
       </div>
 
@@ -1561,6 +1566,16 @@ onUnmounted(() => {
             <p v-if="vokieCheckMessage" class="tiny muted">{{ vokieCheckMessage }}</p>
           </div>
 
+          <div v-else-if="voiceInputTool === 'windows_typing'" class="tool-panel">
+            <div class="chord-line">
+              {{ t("按住遥控器语音键") }} <span class="muted">=</span>
+              <span class="key">Win + H</span>
+            </div>
+            <div class="info-callout callout-small">
+              {{ t("按下自动启动 Windows 语音输入；松开后先排空音频，再尝试暂停。Windows 未提供稳定的停止快捷键，若仍在聆听，请点击语音面板麦克风按钮。") }}
+            </div>
+          </div>
+
           <div v-else-if="voiceInputTool === 'other'" class="tool-panel">
             <p class="tiny muted" style="margin-top: 0">{{ t("选与你输入工具里一致的语音键：") }}</p>
             <div class="chip-select">
@@ -1672,6 +1687,11 @@ onUnmounted(() => {
             <li><span class="mark">1</span><span>{{ t("Vokie 麦克风选 CABLE Output") }}</span></li>
             <li><span class="mark">2</span><span>{{ t("Vokie 快捷键保持默认的 右 Alt") }}</span></li>
             <li><span class="mark">3</span><span>{{ t("在要写字的地方按住遥控器语音键说话") }}</span></li>
+          </ol>
+          <ol v-else-if="voiceInputTool === 'windows_typing'" class="checklist">
+            <li><span class="mark">1</span><span>{{ t("Windows 语音输入的麦克风选 CABLE Output") }}</span></li>
+            <li><span class="mark">2</span><span>{{ t("在文本框中按住遥控器语音键说话") }}</span></li>
+            <li><span class="mark">3</span><span>{{ t("松开后确认听写已暂停；若没有暂停，请点击系统语音面板的麦克风") }}</span></li>
           </ol>
           <ol v-else-if="voiceInputTool === 'other'" class="checklist">
             <li><span class="mark">1</span><span>{{ t("输入工具麦克风选 CABLE Output") }}</span></li>
