@@ -3,8 +3,18 @@
 //! 使用 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run，和 macOS
 //! `SMAppService.mainApp` 一样只影响当前用户，不需要管理员权限。
 
+/// 专属登录启动参数。手动点击快捷方式没有这个参数，因此仍会打开主界面。
+const LOGIN_START_ARGUMENT: &str = "--sayall-login-start";
+
+pub fn launched_at_login() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .any(|arg| arg == std::ffi::OsStr::new(LOGIN_START_ARGUMENT))
+}
+
 #[cfg(windows)]
 mod windows_impl {
+    use super::LOGIN_START_ARGUMENT;
     use std::path::{Path, PathBuf};
     use windows::core::PCWSTR;
     use windows::Win32::System::Registry::{
@@ -159,7 +169,8 @@ mod windows_impl {
         if enabled {
             let executable: PathBuf = std::env::current_exe()
                 .map_err(|error| format!("获取应用程序路径失败：{error}"))?;
-            let command = format!("\"{}\"", executable.display());
+            // 独立标记登录启动；手动启动保持原有窗口策略。
+            let command = format!("\"{}\" {LOGIN_START_ARGUMENT}", executable.display());
             let value = wide(&command);
             let name = wide(VALUE_NAME);
             let key = create_key()?;
@@ -200,7 +211,7 @@ mod windows_impl {
 
     #[cfg(test)]
     mod tests {
-        use super::{command_target, command_targets_executable, paths_equal};
+        use super::{command_target, command_targets_executable, paths_equal, LOGIN_START_ARGUMENT};
         use std::path::Path;
 
         #[test]
@@ -240,6 +251,14 @@ mod windows_impl {
                 "\"C:/Users/Administrator/AppData/Local/SayAll/SayAll.exe\"",
                 executable
             ));
+        }
+
+        #[test]
+        fn startup_command_flag_is_separate_from_executable_path() {
+            let exe = Path::new("C:\\SayAll\\SayAll.exe");
+            let command = format!("\"C:\\SayAll\\SayAll.exe\" {LOGIN_START_ARGUMENT}");
+            assert!(command_targets_executable(&command, exe));
+            assert_eq!(command_target(&command), "C:\\SayAll\\SayAll.exe");
         }
 
         #[test]
