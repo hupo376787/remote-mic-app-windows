@@ -9,7 +9,7 @@ const LOGIN_START_ARGUMENT: &str = "--sayall-login-start";
 pub fn launched_at_login() -> bool {
     std::env::args_os()
         .skip(1)
-        .any(|arg| arg == std::ffi::OsStr::new(LOGIN_START_ARGUMENT))
+        .any(|arg| arg.as_os_str() == std::ffi::OsStr::new(LOGIN_START_ARGUMENT))
 }
 
 #[cfg(windows)]
