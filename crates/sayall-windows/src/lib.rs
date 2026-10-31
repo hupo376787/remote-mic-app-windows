@@ -921,6 +921,11 @@ impl WindowsPlatform {
         // 诊断时间基线（2026-10-09）：失败样本全部来自"切完工具、快速切到目标
         // 窗口"，按下时"距选工具多久"由此起算并进 `voice_attempt`。
         ime::note_tool_select();
+        // Windows 听写走独立的 Win+H 瞬时动作，不可继续保留上个工具的
+        // 报告层合成 usage（否则遥控器语音键会同时触发旧热键）。
+        if matches!(tool, Some(VoiceInputTool::WindowsTyping)) {
+            self.set_voice_hold_hotkey(None);
+        }
         *lock(&self.voice_input_tool) = tool;
         let Some(tool) = tool else {
             *lock(&self.ime_align_pending) = None;
