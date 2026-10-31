@@ -2597,7 +2597,11 @@ fn handle_control(
             gatt_note(format!(
                 "voice_attempt session={session_id} tool={} path={} synth={} synth_confirmed={} fg_self={} fg_pid={} fg_class={} fg_hkl={:#010X} fg_focus={} since_tool_select_ms={} since_hotkey_change_ms={} since_ime_switch_ms={}",
                 crate::ime::tool_label(attempt_tool),
-                press_path(synth_gate, attempt_hotkey.is_some()),
+                if attempt_tool == Some(VoiceInputTool::WindowsTyping) {
+                    "windows_typing"
+                } else {
+                    press_path(synth_gate, attempt_hotkey.is_some())
+                },
                 synth_label(synth_target),
                 synth_gate,
                 crate::ime::foreground_is_self(),
