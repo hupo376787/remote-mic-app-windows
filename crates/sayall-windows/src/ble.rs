@@ -113,6 +113,32 @@ fn press_path(synth_gate: bool, has_hotkey: bool) -> &'static str {
 /// Windows 没有承诺 Win+H 是可靠的「停止」API，必须在真机验证。
 static WINDOWS_TYPING_OWNED: AtomicBool = AtomicBool::new(false);
 
+/// Microsoft Voice Typing takes time to switch into its "Listening" state.
+/// Feed digital silence to CABLE before *buffered* remote speech, so that the
+/// first spoken syllables are not consumed while Win+H is opening.
+/// A post-roll of silence gives Windows' online recognizer time to finalize the
+/// phrase before the experimental second Win+H toggle stops dictation.
+/// Both segments go through WASAPI; do not block the BLE worker with sleep().
+const WINDOWS_TYPING_PCM_RATE: usize = 16_000;
+const WINDOWS_TYPING_PREROLL_SAMPLES: usize = WINDOWS_TYPING_PCM_RATE * 900 / 1000;
+const WINDOWS_TYPING_POSTROLL_SAMPLES: usize = WINDOWS_TYPING_PCM_RATE * 1800 / 1000;
+
+fn queue_windows_typing_padding(
+    audio: &AudioRuntime,
+    generation: u64,
+    sample_count: usize,
+    phase: &str,
+) -> Result<(), PlatformError> {
+    // Keep pre/post-roll exclusively in the CABLE playback path, not in usage
+    // counters, transcript WAV recordings, or actual microphone rate metrics.
+    audio.enqueue_samples(generation, vec![0; sample_count])?;
+    gatt_note(format!(
+        "windows_typing phase={phase} result=queued padding_samples={sample_count} padding_ms={} generation={generation}",
+        sample_count * 1000 / WINDOWS_TYPING_PCM_RATE
+    ));
+    Ok(())
+}
+
 fn windows_typing_chord() -> KeyChord {
     KeyChord {
         keys: vec![KeyCode::LeftWindows, KeyCode::H],
@@ -145,6 +171,20 @@ fn stop_windows_typing(send_input: &SendInputRuntime, reason: &str) {
             "failed"
         }
     ));
+}
+
+#[cfg(test)]
+mod windows_typing_audio_timing_tests {
+    use super::*;
+
+    #[test]
+    fn silence_padding_covers_recognizer_startup_and_end_of_speech() {
+        assert_eq!(WINDOWS_TYPING_PREROLL_SAMPLES, 14_400);
+        assert_eq!(WINDOWS_TYPING_POSTROLL_SAMPLES, 28_800);
+        // Silence is delivered to Windows but not counted as remote audio.
+        assert_eq!(WINDOWS_TYPING_PREROLL_SAMPLES * 1000 / WINDOWS_TYPING_PCM_RATE, 900);
+        assert_eq!(WINDOWS_TYPING_POSTROLL_SAMPLES * 1000 / WINDOWS_TYPING_PCM_RATE, 1800);
+    }
 }
 
 /// 报告层合成目标标签（日志 `synth=`）：`off` 或具体 HID usage。
@@ -2796,6 +2836,30 @@ fn handle_control(
                 );
                 return;
             }
+            if attempt_tool == Some(VoiceInputTool::WindowsTyping) {
+                // Queue silence before real samples: the audio worker preserves
+                // FIFO order even if the remote begins speaking immediately.
+                if let Err(error) = queue_windows_typing_padding(
+                    audio,
+                    generation,
+                    WINDOWS_TYPING_PREROLL_SAMPLES,
+                    "preroll",
+                ) {
+                    abort_voice_session(
+                        session,
+                        pipeline,
+                        state,
+                        audio,
+                        send_input,
+                        held_hotkey,
+                        active_voice_samples,
+                        Some(session_id),
+                        format!("Windows 语音输入音频预热失败：{error}"),
+                        usage,
+                    );
+                    return;
+                }
+            }
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Streaming;
             apply_input_connection_phase(ConnectionPhase::Streaming);
@@ -2816,6 +2880,14 @@ fn handle_control(
             // 会话结束：取消 MIC_EXTEND 续期节拍（中止路径的过期节拍会在触发时
             // 自行检查会话状态并清除，无需逐处清理）。
             *extend_deadline = None;
+            // Read actual device-to-device duration BEFORE synthetic silence and
+            // WASAPI drain; otherwise post-roll would falsely mark healthy
+            // Bluetooth audio as degraded.
+            let duration_ms = voice_stream_started_at
+                .take()
+                .map(|started| started.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let samples = *active_voice_samples;
             // 第三方输入法按住式热键需立即释放；Windows Win+H 则须等
             // 音频排空后再停止，防止语句尾部音频还没有写进 VB-CABLE。
             release_voice_hold_hotkey_only(send_input, held_hotkey);
@@ -2824,6 +2896,30 @@ fn handle_control(
                 snapshot.phase = ConnectionPhase::Draining;
                 apply_input_connection_phase(ConnectionPhase::Draining);
                 snapshot.voice_state = VoiceSessionState::Draining;
+            }
+            if WINDOWS_TYPING_OWNED.load(Ordering::SeqCst) {
+                // Don't cut off recognition at the BLE key-up: an actual interval
+                // of silence must reach CABLE Output before toggling Win+H.
+                if let Err(error) = queue_windows_typing_padding(
+                    audio,
+                    generation,
+                    WINDOWS_TYPING_POSTROLL_SAMPLES,
+                    "postroll",
+                ) {
+                    abort_voice_session(
+                        session,
+                        pipeline,
+                        state,
+                        audio,
+                        send_input,
+                        held_hotkey,
+                        active_voice_samples,
+                        None,
+                        format!("Windows 语音输入收尾静音失败：{error}"),
+                        usage,
+                    );
+                    return;
+                }
             }
             if let Err(error) = audio.finish_session(generation) {
                 abort_voice_session(
@@ -2846,11 +2942,6 @@ fn handle_control(
                 return;
             }
             stop_windows_typing(send_input, "released_after_drain");
-            let duration_ms = voice_stream_started_at
-                .take()
-                .map(|started| started.elapsed().as_millis() as u64)
-                .unwrap_or(0);
-            let samples = *active_voice_samples;
             if let Some((rate_hz, health)) = classify_voice_audio_rate(samples, duration_ms) {
                 gatt_note(format!(
                     "voice_audio_rate result={} rate_hz={rate_hz} samples={samples} duration_ms={duration_ms} expected_hz={VOICE_EXPECTED_SAMPLE_RATE_HZ}",
