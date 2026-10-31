@@ -50,6 +50,8 @@ pub enum VoiceInputTool {
     Doubao,
     Vokie,
     Other,
+    /// 使用 Windows 自带的 Win+H 语音键入；不需要第三方输入法。
+    WindowsTyping,
 }
 
 /// 应用图标（设置页「应用图标」，2026-10-02 用户指定）。
@@ -319,6 +321,7 @@ mod tests {
             VoiceInputTool::Doubao,
             VoiceInputTool::Vokie,
             VoiceInputTool::Other,
+            VoiceInputTool::WindowsTyping,
         ] {
             let settings = AppSettings {
                 voice_input_tool: Some(tool),
