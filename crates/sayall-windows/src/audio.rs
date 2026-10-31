@@ -14,11 +14,15 @@ use wasapi::{
 const SOURCE_SAMPLE_RATE: usize = 16_000;
 const SOURCE_CHANNELS: usize = 1;
 const PREBUFFER_SAMPLES: usize = 480;
-const MAX_QUEUE_SAMPLES: usize = SOURCE_SAMPLE_RATE * 2;
+// Native Windows dictation queues up to 0.9s startup + 1.8s end silence;
+// reserve room for those samples and normal BLE jitter without dropping speech.
+const MAX_QUEUE_SAMPLES: usize = SOURCE_SAMPLE_RATE * 4;
 const MESSAGE_QUEUE_CAPACITY: usize = 32;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+// The Windows native-typing post-roll is real audio, not a blocking sleep.
+// A 3-second timeout can abort a valid pre-roll + short utterance + tail.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_MUTE_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 const PUMP_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 static AUDIO_ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);

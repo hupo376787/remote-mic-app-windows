@@ -1,4 +1,5 @@
 name: Windows CI
+# One-time cloud verification request: Windows native Win+H voice typing (2026-10-31).
 
 on:
   push:

@@ -196,7 +196,11 @@ const vokie = ref<VokieInstallation | null>(null);
 const vokieBusy = ref(false);
 const toolMessage = ref("");
 const hotkeyLabel = computed(() =>
-  currentHotkey.value ? voiceHoldHotkeyLabel(currentHotkey.value) : t("不按键"),
+  stagedTool.value === "windows_typing"
+    ? "Win + H"
+    : currentHotkey.value
+      ? voiceHoldHotkeyLabel(currentHotkey.value)
+      : t("不按键"),
 );
 
 // ---- 普通按键体验 / 完成步骤 ----
@@ -967,6 +971,10 @@ function hotkeyForTool(tool: VoiceInputTool): KeyChord | null {
       return { keys: ["right_alt"] };
     case "wechat":
       return { keys: ["left_control", "left_windows"] };
+    case "windows_typing":
+      // Windows 内置听写由 BLE 会话单独发送瞬时 Win+H，
+      // 不能当作持有型热键传给报告层合成。
+      return null;
     case "other": {
       const keys = otherKeys.value ?? [];
       return keys.length ? { keys } : null;
@@ -1575,6 +1583,8 @@ const voiceToolLabel = computed(() => {
       return t("微信输入法");
     case "vokie":
       return "Vokie";
+    case "windows_typing":
+      return t("Windows 自带语音输入");
     case "other":
       return t("其他工具");
     default:

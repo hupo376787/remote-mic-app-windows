@@ -132,6 +132,9 @@ export function buildSidePanel(step: OnboardingStep, ctx: SidePanelContext): Sid
         case "wechat":
           rows.push({ label: t("无需额外设置"), state: "ok" });
           break;
+        case "windows_typing":
+          rows.push({ label: t("Windows 自带语音输入"), state: "ok" });
+          break;
         case "other":
           rows.push({
             label: t("已选择语音键"),

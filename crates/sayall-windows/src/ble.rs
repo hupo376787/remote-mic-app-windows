@@ -16,7 +16,7 @@ use crate::{
 use sayall_core::settings::VoiceInputTool;
 use sayall_core::{AtvvCommand, AtvvVoicePipeline, PipelineOutput, VoiceSessionState};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, Receiver, Sender},
     Arc, Mutex, MutexGuard, OnceLock,
 };
@@ -104,6 +104,92 @@ fn press_path(synth_gate: bool, has_hotkey: bool) -> &'static str {
         "send_input"
     } else {
         "none"
+    }
+}
+
+/// Windows 自带语音键入是切换式 Win+H，而不是可保持的热键。
+/// 仅在本应用实际注入成功后标记活动；正常结束在音频排空后尝试再次
+/// Win+H 暂停，异常/睡眠/断连/退出通过统一清理立即尝试暂停。
+/// Windows 没有承诺 Win+H 是可靠的「停止」API，必须在真机验证。
+static WINDOWS_TYPING_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// Microsoft Voice Typing takes time to switch into its "Listening" state.
+/// Feed digital silence to CABLE before *buffered* remote speech, so that the
+/// first spoken syllables are not consumed while Win+H is opening.
+/// A post-roll of silence gives Windows' online recognizer time to finalize the
+/// phrase before the experimental second Win+H toggle stops dictation.
+/// Both segments go through WASAPI; do not block the BLE worker with sleep().
+const WINDOWS_TYPING_PCM_RATE: usize = 16_000;
+const WINDOWS_TYPING_PREROLL_SAMPLES: usize = WINDOWS_TYPING_PCM_RATE * 900 / 1000;
+const WINDOWS_TYPING_POSTROLL_SAMPLES: usize = WINDOWS_TYPING_PCM_RATE * 1800 / 1000;
+
+fn queue_windows_typing_padding(
+    audio: &AudioRuntime,
+    generation: u64,
+    sample_count: usize,
+    phase: &str,
+) -> Result<(), PlatformError> {
+    // Keep pre/post-roll exclusively in the CABLE playback path, not in usage
+    // counters, transcript WAV recordings, or actual microphone rate metrics.
+    audio.enqueue_samples(generation, vec![0; sample_count])?;
+    gatt_note(format!(
+        "windows_typing phase={phase} result=queued padding_samples={sample_count} padding_ms={} generation={generation}",
+        sample_count * 1000 / WINDOWS_TYPING_PCM_RATE
+    ));
+    Ok(())
+}
+
+fn windows_typing_chord() -> KeyChord {
+    KeyChord {
+        keys: vec![KeyCode::LeftWindows, KeyCode::H],
+    }
+}
+
+fn start_windows_typing(send_input: &SendInputRuntime) -> Result<(), PlatformError> {
+    if WINDOWS_TYPING_OWNED.load(Ordering::SeqCst) {
+        gatt_note("windows_typing phase=start result=skipped reason=already_owned".to_owned());
+        return Ok(());
+    }
+    send_input.tap(windows_typing_chord())?;
+    WINDOWS_TYPING_OWNED.store(true, Ordering::SeqCst);
+    gatt_note("windows_typing phase=start result=submitted method=win_h".to_owned());
+    Ok(())
+}
+
+fn stop_windows_typing(send_input: &SendInputRuntime, reason: &str) {
+    if !WINDOWS_TYPING_OWNED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    // Win+H 在已打开听写面板时通常切换聆听状态，但微软只正式保证
+    // 点击麦克风/语音指令停止；不发送 Escape，以免关闭用户应用的对话框。
+    let result = send_input.tap(windows_typing_chord());
+    gatt_note(format!(
+        "windows_typing phase=stop result={} method=win_h_toggle reason={reason} verified=false",
+        if result.is_ok() {
+            "submitted"
+        } else {
+            "failed"
+        }
+    ));
+}
+
+#[cfg(test)]
+mod windows_typing_audio_timing_tests {
+    use super::*;
+
+    #[test]
+    fn silence_padding_covers_recognizer_startup_and_end_of_speech() {
+        assert_eq!(WINDOWS_TYPING_PREROLL_SAMPLES, 14_400);
+        assert_eq!(WINDOWS_TYPING_POSTROLL_SAMPLES, 28_800);
+        // Silence is delivered to Windows but not counted as remote audio.
+        assert_eq!(
+            WINDOWS_TYPING_PREROLL_SAMPLES * 1000 / WINDOWS_TYPING_PCM_RATE,
+            900
+        );
+        assert_eq!(
+            WINDOWS_TYPING_POSTROLL_SAMPLES * 1000 / WINDOWS_TYPING_PCM_RATE,
+            1800
+        );
     }
 }
 
@@ -2563,7 +2649,11 @@ fn handle_control(
             gatt_note(format!(
                 "voice_attempt session={session_id} tool={} path={} synth={} synth_confirmed={} fg_self={} fg_pid={} fg_class={} fg_hkl={:#010X} fg_focus={} since_tool_select_ms={} since_hotkey_change_ms={} since_ime_switch_ms={}",
                 crate::ime::tool_label(attempt_tool),
-                press_path(synth_gate, attempt_hotkey.is_some()),
+                if attempt_tool == Some(VoiceInputTool::WindowsTyping) {
+                    "windows_typing"
+                } else {
+                    press_path(synth_gate, attempt_hotkey.is_some())
+                },
                 synth_label(synth_target),
                 synth_gate,
                 crate::ime::foreground_is_self(),
@@ -2597,7 +2687,25 @@ fn handle_control(
                     "voice_path fallback session={session_id} tool=doubao reason=report_layer_inactive note=tool_ignores_injected_keys"
                 ));
             }
-            if synth_gate {
+            if attempt_tool == Some(VoiceInputTool::WindowsTyping) {
+                // 与持有式快捷键互斥：Windows 听写用 Win+H 切换一次，
+                // 不能把 Win 键保持到松开，否则会污染语音期间的正常输入。
+                if let Err(error) = start_windows_typing(send_input) {
+                    abort_voice_session(
+                        session,
+                        pipeline,
+                        state,
+                        audio,
+                        send_input,
+                        held_hotkey,
+                        active_voice_samples,
+                        Some(session_id),
+                        format!("启动 Windows 语音输入失败：{error}"),
+                        usage,
+                    );
+                    return;
+                }
+            } else if synth_gate {
                 // 生效判据的按下时刻与基线：必须在此刻取——IME 切换等后续动作可能耗时，
                 // 之后取会把期间到达的帧证据误算进基线（见 spawn_voice_effect_check）。
                 let effect_press_at = Instant::now();
@@ -2734,6 +2842,30 @@ fn handle_control(
                 );
                 return;
             }
+            if attempt_tool == Some(VoiceInputTool::WindowsTyping) {
+                // Queue silence before real samples: the audio worker preserves
+                // FIFO order even if the remote begins speaking immediately.
+                if let Err(error) = queue_windows_typing_padding(
+                    audio,
+                    generation,
+                    WINDOWS_TYPING_PREROLL_SAMPLES,
+                    "preroll",
+                ) {
+                    abort_voice_session(
+                        session,
+                        pipeline,
+                        state,
+                        audio,
+                        send_input,
+                        held_hotkey,
+                        active_voice_samples,
+                        Some(session_id),
+                        format!("Windows 语音输入音频预热失败：{error}"),
+                        usage,
+                    );
+                    return;
+                }
+            }
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Streaming;
             apply_input_connection_phase(ConnectionPhase::Streaming);
@@ -2754,13 +2886,46 @@ fn handle_control(
             // 会话结束：取消 MIC_EXTEND 续期节拍（中止路径的过期节拍会在触发时
             // 自行检查会话状态并清除，无需逐处清理）。
             *extend_deadline = None;
-            // 松手统一释放：无论音频排空是否成功，先释放按住的快捷键。
-            release_voice_hold_hotkey(send_input, held_hotkey);
+            // Read actual device-to-device duration BEFORE synthetic silence and
+            // WASAPI drain; otherwise post-roll would falsely mark healthy
+            // Bluetooth audio as degraded.
+            let duration_ms = voice_stream_started_at
+                .take()
+                .map(|started| started.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let samples = *active_voice_samples;
+            // 第三方输入法按住式热键需立即释放；Windows Win+H 则须等
+            // 音频排空后再停止，防止语句尾部音频还没有写进 VB-CABLE。
+            release_voice_hold_hotkey_only(send_input, held_hotkey);
             {
                 let mut snapshot = lock(state);
                 snapshot.phase = ConnectionPhase::Draining;
                 apply_input_connection_phase(ConnectionPhase::Draining);
                 snapshot.voice_state = VoiceSessionState::Draining;
+            }
+            if WINDOWS_TYPING_OWNED.load(Ordering::SeqCst) {
+                // Don't cut off recognition at the BLE key-up: an actual interval
+                // of silence must reach CABLE Output before toggling Win+H.
+                if let Err(error) = queue_windows_typing_padding(
+                    audio,
+                    generation,
+                    WINDOWS_TYPING_POSTROLL_SAMPLES,
+                    "postroll",
+                ) {
+                    abort_voice_session(
+                        session,
+                        pipeline,
+                        state,
+                        audio,
+                        send_input,
+                        held_hotkey,
+                        active_voice_samples,
+                        None,
+                        format!("Windows 语音输入收尾静音失败：{error}"),
+                        usage,
+                    );
+                    return;
+                }
             }
             if let Err(error) = audio.finish_session(generation) {
                 abort_voice_session(
@@ -2778,14 +2943,11 @@ fn handle_control(
                 return;
             }
             if let Err(error) = pipeline.complete_drain(generation) {
+                stop_windows_typing(send_input, "drain_failed");
                 lock(state).last_error = Some(error.to_string());
                 return;
             }
-            let duration_ms = voice_stream_started_at
-                .take()
-                .map(|started| started.elapsed().as_millis() as u64)
-                .unwrap_or(0);
-            let samples = *active_voice_samples;
+            stop_windows_typing(send_input, "released_after_drain");
             if let Some((rate_hz, health)) = classify_voice_audio_rate(samples, duration_ms) {
                 gatt_note(format!(
                     "voice_audio_rate result={} rate_hz={rate_hz} samples={samples} duration_ms={duration_ms} expected_hz={VOICE_EXPECTED_SAMPLE_RATE_HZ}",
@@ -3013,6 +3175,14 @@ fn abort_voice_session(
 /// 释放失败会记录在 SendInput 快照的 last_error 中，由诊断摘要呈现。
 /// 同时解除语音键 F5 抑制器的会话武装（覆盖停止/中止/断连/退出全部路径）。
 fn release_voice_hold_hotkey(send_input: &SendInputRuntime, held_hotkey: &mut Option<KeyChord>) {
+    release_voice_hold_hotkey_only(send_input, held_hotkey);
+    stop_windows_typing(send_input, "cleanup");
+}
+
+fn release_voice_hold_hotkey_only(
+    send_input: &SendInputRuntime,
+    held_hotkey: &mut Option<KeyChord>,
+) {
     crate::key_suppressor::set_session_active(false);
     if let Some(chord) = held_hotkey.take() {
         // 功能点日志：释放结果（与 chord_press 成对，粘键排查的另一半）。

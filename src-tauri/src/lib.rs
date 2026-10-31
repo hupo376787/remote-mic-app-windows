@@ -1391,8 +1391,9 @@ fn should_show_main_window_on_startup(
     onboarding_active: bool,
     completed_update: bool,
     open_window_at_launch: bool,
+    silent_login_launch: bool,
 ) -> bool {
-    onboarding_active || completed_update || open_window_at_launch
+    !silent_login_launch && (onboarding_active || completed_update || open_window_at_launch)
 }
 
 /// 把主窗口从「最小化 / 收进托盘」恢复到可见并尝试置前（2026-10-03 用户报障：
@@ -4197,6 +4198,7 @@ pub(crate) fn voice_input_tool_name(tool: Option<VoiceInputTool>) -> &'static st
         Some(VoiceInputTool::Doubao) => "doubao",
         Some(VoiceInputTool::Vokie) => "vokie",
         Some(VoiceInputTool::Other) => "other",
+        Some(VoiceInputTool::WindowsTyping) => "windows_typing",
         None => "unset",
     }
 }
@@ -4563,6 +4565,39 @@ async fn set_open_window_at_launch(
         ),
     });
     result
+}
+
+#[tauri::command]
+async fn get_silent_launch_at_login(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        settings
+            .load()
+            .map(|settings| settings.silent_launch_at_login)
+    })
+    .await
+    .map_err(|error| format!("读取开机静默启动设置任务失败：{error}"))?
+}
+
+#[tauri::command]
+fn set_silent_launch_at_login(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let previous = state.settings.load()?.silent_launch_at_login;
+    state.settings.save_silent_launch_at_login(enabled)?;
+    // Upgrade legacy Run entries that predate the --sayall-login-start marker.
+    // A save error restores the user's previous preference.
+    if startup::is_enabled()? {
+        if let Err(error) = startup::set_enabled(true) {
+            let _ = state.settings.save_silent_launch_at_login(previous);
+            return Err(error);
+        }
+    }
+    sayall_windows::gatt_note(format!(
+        "startup feature=silent_launch_at_login action=save terminal_result=passed enabled={enabled}"
+    ));
+    Ok(enabled)
 }
 
 /// 本次启动前刚完成更新时的版本号；没有则返回 `null`。
@@ -5227,10 +5262,17 @@ pub fn run() {
                     // 请求已运行实例把主窗口显示出来（命名事件由对端的
                     // `spawn_second_instance_listener` 等待；对端是未带此功能的
                     // 旧版本时请求失败，如实记录但按原样退出）。
-                    let show_request = sayall_windows::instance_signal::request_show_main_window();
+                    // 登录自启动的第二实例不应强制弹出已在运行的窗口；
+                    // 只有用户手动双击应用时才请求已运行实例显示主界面。
+                    let show_request = if startup::launched_at_login() {
+                        None
+                    } else {
+                        Some(sayall_windows::instance_signal::request_show_main_window())
+                    };
                     let (request_result, request_error) = match &show_request {
-                        Ok(()) => ("passed", "none".to_owned()),
-                        Err(error) => {
+                        None => ("skipped", "none".to_owned()),
+                        Some(Ok(())) => ("passed", "none".to_owned()),
+                        Some(Err(error)) => {
                             ("failed", format!("hresult=0x{:08x}", error.code().0 as u32))
                         }
                     };
@@ -5422,10 +5464,16 @@ pub fn run() {
             //
             // 仿真构建不隐藏：CI 的 runtime simulation 依赖窗口里的 WebView 完成
             // 页面旅程，隐藏窗口会让 WebView2 进入后台节流，报告可能写不出来。
+            // 仅 Windows Run 项带 --sayall-login-start 参数；普通快捷方式
+            // 不带此参数，仍遵守原“启动时自动打开主面板”设置。
+            // 静默登录启动优先于向导和更新提示，用户随时可从托盘显示主窗口。
+            let silent_login_launch =
+                startup::launched_at_login() && saved_settings.silent_launch_at_login;
             let show_main_window_on_startup = should_show_main_window_on_startup(
                 onboarding_active,
                 completed_update,
                 saved_settings.open_window_at_launch,
+                silent_login_launch,
             );
             #[cfg(feature = "runtime-simulation")]
             let show_main_window_on_startup =
@@ -5455,9 +5503,14 @@ pub fn run() {
                     let hide_result = window.hide();
                     let visible_after = window.is_visible().unwrap_or(true);
                     sayall_windows::gatt_note(format!(
-                        "startup feature=main_window_visibility action=decide terminal_result={} visible={} reason=open_window_at_launch_disabled onboarding_active={onboarding_active} completed_update={completed_update} open_window_at_launch={} hide_result={hide_result:?} visible_before={visible_before} visible_after={visible_after}",
+                        "startup feature=main_window_visibility action=decide terminal_result={} visible={} reason={} onboarding_active={onboarding_active} completed_update={completed_update} open_window_at_launch={} silent_login_launch={silent_login_launch} hide_result={hide_result:?} visible_before={visible_before} visible_after={visible_after}",
                         if visible_after { "failed" } else { "passed" },
                         visible_after,
+                        if silent_login_launch {
+                            "login_silent_tray"
+                        } else {
+                            "open_window_at_launch_disabled"
+                        },
                         saved_settings.open_window_at_launch
                     ));
                 }
@@ -6121,6 +6174,8 @@ pub fn run() {
         set_launch_at_login,
         get_open_window_at_launch,
         set_open_window_at_launch,
+        get_silent_launch_at_login,
+        set_silent_launch_at_login,
         take_update_completed_version,
         report_theme_result,
         get_app_icon,
@@ -6258,6 +6313,8 @@ pub fn run() {
         set_launch_at_login,
         get_open_window_at_launch,
         set_open_window_at_launch,
+        get_silent_launch_at_login,
+        set_silent_launch_at_login,
         take_update_completed_version,
         report_theme_result,
         get_app_icon,
@@ -6365,15 +6422,27 @@ mod tests {
     /// 只驻留托盘；但向导进行中必须显示，否则用户没有入口完成设置。
     #[test]
     fn startup_visibility_follows_onboarding_and_preference() {
-        // 未完成向导：无论开关与更新状态都显示。
-        assert!(should_show_main_window_on_startup(true, false, true));
-        assert!(should_show_main_window_on_startup(true, false, false));
-        assert!(should_show_main_window_on_startup(true, true, false));
-        // 已完成向导 + 普通启动：只看开关。
-        assert!(should_show_main_window_on_startup(false, false, true));
-        assert!(!should_show_main_window_on_startup(false, false, false));
-        // 已完成向导 + 本次启动前刚完成更新：开关关着也必须显示（Mac 同款）。
-        assert!(should_show_main_window_on_startup(false, true, false));
+        // 以前的启动策略仍然适用于手动双击和普通自启。
+        assert!(should_show_main_window_on_startup(true, false, true, false));
+        assert!(should_show_main_window_on_startup(
+            true, false, false, false
+        ));
+        assert!(should_show_main_window_on_startup(true, true, false, false));
+        assert!(should_show_main_window_on_startup(
+            false, false, true, false
+        ));
+        assert!(!should_show_main_window_on_startup(
+            false, false, false, false
+        ));
+        assert!(should_show_main_window_on_startup(
+            false, true, false, false
+        ));
+        // 登录静默启动：即使普通启动开主界面、正在更新或向导中，也不闪出窗口。
+        assert!(!should_show_main_window_on_startup(
+            false, false, true, true
+        ));
+        assert!(!should_show_main_window_on_startup(true, false, true, true));
+        assert!(!should_show_main_window_on_startup(false, true, true, true));
     }
 
     #[test]

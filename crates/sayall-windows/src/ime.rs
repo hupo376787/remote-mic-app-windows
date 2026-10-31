@@ -90,7 +90,7 @@ pub fn ime_target_for(tool: VoiceInputTool) -> Option<ImeProfile> {
     match tool {
         VoiceInputTool::Wechat => Some(WETYPE_IME),
         VoiceInputTool::Doubao => Some(DOUBAO_IME),
-        VoiceInputTool::Vokie | VoiceInputTool::Other => None,
+        VoiceInputTool::Vokie | VoiceInputTool::Other | VoiceInputTool::WindowsTyping => None,
     }
 }
 /// STA 激活线程的有界等待：正常 <10ms，500ms 只是防卡上限。
@@ -671,6 +671,7 @@ pub(crate) fn tool_label(tool: Option<VoiceInputTool>) -> &'static str {
         Some(VoiceInputTool::Doubao) => "doubao",
         Some(VoiceInputTool::Vokie) => "vokie",
         Some(VoiceInputTool::Other) => "other",
+        Some(VoiceInputTool::WindowsTyping) => "windows_typing",
         None => "none",
     }
 }
@@ -1529,7 +1530,11 @@ mod ime_target_tests {
     /// NotRequired，不碰 TSF（2026-09-29 真机回归过"豆包路径被切成微信"）。
     #[test]
     fn vokie_and_other_do_not_touch_input_methods() {
-        for tool in [VoiceInputTool::Vokie, VoiceInputTool::Other] {
+        for tool in [
+            VoiceInputTool::Vokie,
+            VoiceInputTool::Other,
+            VoiceInputTool::WindowsTyping,
+        ] {
             assert_eq!(
                 super::ensure_session_ime(tool, super::ImeSwitchScope::VoicePress),
                 Ok(super::ImeActivation::NotRequired)
