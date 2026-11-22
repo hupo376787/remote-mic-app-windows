@@ -36,13 +36,14 @@ pub const INSTALL_EVIDENCE_FILES: [&str; 4] = [
     "other-voice-hotkey.json",
 ];
 
-/// 向导步骤（顺序即导航顺序，设计稿 §3 的 7 步）。
+/// 向导步骤（前端决定导航顺序；2026-11-05 起「全按键支持」在语音设备之后）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnboardingStep {
     Welcome,
     Remote,
     Audio,
+    FullKey,
     VoiceTool,
     VoiceTest,
     Controls,
@@ -55,6 +56,7 @@ impl OnboardingStep {
             Self::Welcome => "welcome",
             Self::Remote => "remote",
             Self::Audio => "audio",
+            Self::FullKey => "full_key",
             Self::VoiceTool => "voice_tool",
             Self::VoiceTest => "voice_test",
             Self::Controls => "controls",
@@ -74,6 +76,7 @@ impl<'de> Deserialize<'de> for OnboardingStep {
         Ok(match value.as_str() {
             "welcome" => Self::Welcome,
             "remote" => Self::Remote,
+            "full_key" => Self::FullKey,
             "audio" => Self::Audio,
             "voice_tool" => Self::VoiceTool,
             "voice_test" => Self::VoiceTest,
@@ -89,6 +92,7 @@ pub fn parse_step(value: &str) -> Option<OnboardingStep> {
     Some(match value {
         "welcome" => OnboardingStep::Welcome,
         "remote" => OnboardingStep::Remote,
+        "full_key" => OnboardingStep::FullKey,
         "audio" => OnboardingStep::Audio,
         "voice_tool" => OnboardingStep::VoiceTool,
         "voice_test" => OnboardingStep::VoiceTest,
@@ -100,7 +104,7 @@ pub fn parse_step(value: &str) -> Option<OnboardingStep> {
 
 /// 向导事务中的 staged 语音绑定（设计稿 §5.4 / §6）。
 ///
-/// 语义：用户在第④步选择输入工具时**立即**把「工具 + 按住说话快捷键」应用到
+/// 语义：用户在第⑤步选择输入工具时**立即**把「工具 + 按住说话快捷键」应用到
 /// 运行时与正式配置（保证第⑤步真实验证可用），同时保存进入向导前的正式值作为
 /// 回滚快照；只有真实验证通过（完成向导）才提交（清除快照、保留当前值）。
 /// 退出未完成流程（下次启动）、重跑向导时回滚到快照，保证老用户的选择不被
@@ -251,6 +255,13 @@ mod tests {
         let decoded: OnboardingState = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, state);
 
+        // 新步骤（2026-11-05）必须能持久化与恢复，不能回落成 Welcome。
+        state.step = OnboardingStep::FullKey;
+        let encoded = serde_json::to_string(&state).unwrap();
+        assert!(encoded.contains("\"step\":\"full_key\""));
+        let decoded: OnboardingState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.step, OnboardingStep::FullKey);
+
         // 陌生步骤名不允许把整份状态打成解析失败：归一化为 Welcome，其余字段保留。
         let decoded: OnboardingState = serde_json::from_str(
             r#"{"flow_version":1,"completed_version":0,"step":"legacy_step","migration_version":1}"#,
@@ -295,6 +306,7 @@ mod tests {
     #[test]
     fn parse_step_rejects_unknown_values_for_ipc() {
         assert_eq!(parse_step("voice_tool"), Some(OnboardingStep::VoiceTool));
+        assert_eq!(parse_step("full_key"), Some(OnboardingStep::FullKey));
         assert_eq!(parse_step("complete"), Some(OnboardingStep::Complete));
         assert_eq!(parse_step("legacy_step"), None);
         assert_eq!(parse_step(""), None);

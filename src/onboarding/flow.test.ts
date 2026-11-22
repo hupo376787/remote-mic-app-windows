@@ -6,6 +6,7 @@ import {
   normalizeStep,
   phaseOf,
   previousStep,
+  stepProgressPercent,
   type OnboardingContext,
   type OnboardingStep,
 } from "./flow";
@@ -48,11 +49,12 @@ function makeContext(
 }
 
 describe("onboarding step order", () => {
-  it("keeps the confirmed Mac order (D1): welcome, remote, audio, voice_tool, voice_test, controls, complete", () => {
+  it("keeps the optional full-key step after the audio device (2026-11-21 决定)", () => {
     expect(ONBOARDING_STEPS).toEqual([
       "welcome",
       "remote",
       "audio",
+      "full_key",
       "voice_tool",
       "voice_test",
       "controls",
@@ -60,10 +62,11 @@ describe("onboarding step order", () => {
     ]);
   });
 
-  it("maps phases: prepare for welcome, setup for the three config steps, try_it for the rest", () => {
+  it("maps phases: prepare for welcome, setup for the config steps, try_it for the rest", () => {
     expect(phaseOf("welcome")).toBe("prepare");
     expect(phaseOf("remote")).toBe("setup");
     expect(phaseOf("audio")).toBe("setup");
+    expect(phaseOf("full_key")).toBe("setup");
     expect(phaseOf("voice_tool")).toBe("setup");
     expect(phaseOf("voice_test")).toBe("try_it");
     expect(phaseOf("controls")).toBe("try_it");
@@ -73,10 +76,29 @@ describe("onboarding step order", () => {
   it("navigates forward and backward without auto-skipping", () => {
     expect(previousStep("welcome")).toBeNull();
     expect(nextStep("welcome")).toBe("remote");
+    expect(nextStep("remote")).toBe("audio");
+    expect(nextStep("audio")).toBe("full_key");
+    expect(nextStep("full_key")).toBe("voice_tool");
+    expect(previousStep("full_key")).toBe("audio");
+    expect(previousStep("voice_tool")).toBe("full_key");
     expect(previousStep("audio")).toBe("remote");
     expect(nextStep("controls")).toBe("complete");
     expect(nextStep("complete")).toBeNull();
     expect(previousStep("remote")).toBe("welcome");
+  });
+
+  it("derives a strictly increasing progress percent from the step order", () => {
+    const percentages = ONBOARDING_STEPS.map(stepProgressPercent);
+    // 2026-11-21 顺序变更回归：手写映射曾让进度条从 44% 倒退到 16%。
+    for (let i = 1; i < percentages.length; i += 1) {
+      expect(percentages[i]).toBeGreaterThan(percentages[i - 1]);
+    }
+    expect(percentages[0]).toBeGreaterThan(0);
+    expect(percentages.at(-1)).toBe(100);
+    expect(stepProgressPercent("welcome")).toBe(4);
+    expect(stepProgressPercent("remote")).toBe(18);
+    expect(stepProgressPercent("full_key")).toBe(45);
+    expect(stepProgressPercent("complete")).toBe(100);
   });
 
   it("normalizes unknown persisted steps to welcome (older/newer writers must not strand the flow)", () => {
@@ -95,6 +117,11 @@ describe("onboarding gates", () => {
       "remote",
       { remote: { rawInputPhase: "starting", remoteButtonObserved: false } },
       "remote.listener_not_ready",
+    ],
+    [
+      "remote",
+      { remote: { rawInputPhase: "awaiting", remoteButtonObserved: false } },
+      "remote.hid_interface_missing",
     ],
     ["remote", { remote: { remoteButtonObserved: false } }, "remote.button_not_ready"],
     ["audio", { audio: { recommendedEndpointAvailable: false } }, "audio.install_required"],
@@ -159,6 +186,11 @@ describe("onboarding gates", () => {
     for (const step of ONBOARDING_STEPS) {
       expect(evaluateGate(step, makeContext()).ok).toBe(true);
     }
+  });
+
+  it("never blocks the optional full-key step (the switch is guidance, not a gate)", () => {
+    // 基础语音与普通按键不依赖系统授权；拒绝授权或 ARM64 不可用时也必须能走完向导。
+    expect(evaluateGate("full_key", makeContext())).toEqual({ ok: true, code: null });
   });
 
   it("treats wechat as immediately satisfied and doubao as needing both capture and no Vokie conflict", () => {

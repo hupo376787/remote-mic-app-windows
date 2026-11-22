@@ -10,7 +10,9 @@
 //! - **钩子线程**：常驻 WH_KEYBOARD_LL 钩子（专职消息泵）。吞键判定只针对
 //!   F5，其余按键一律透传；武装条件（其一）：ATVV 语音会话进行中
 //!   （`set_session_active`，BLE 工作线程调用）、BLE 正处于连接建立/重连
-//!   窗口，或主 Raw Input 监听器在武装宽限（250ms）内观察到来自遥控器的 F5；首个
+//!   窗口**且 Raw Input 监听器已绑定到遥控器 HID 设备**（`key_gate::listener_active`，
+//!   避免无限 `Reconnecting` 误吞实体键盘 F5，issue #368），或主 Raw Input
+//!   监听器在武装宽限（250ms）内观察到来自遥控器的 F5；首个
 //!   F5 在回调内有界等待 60ms 等任一武装信号（物理 F5 最坏 +60ms 延迟，
 //!   ZSTDJan 同款取舍）。
 //! - **Raw Input 归因**：由 `raw_input_windows.rs` 的进程唯一注册窗口转发。
@@ -43,12 +45,28 @@ mod windows_impl {
 
     const ARM_GRACE_MS: u64 = 250;
     const BOUNDED_WAIT_MS: u64 = 60;
+    /// 按住锁存的最大 DOWN 沿间隔（2026-11-06 现场修复）。
+    ///
+    /// 现场：长按第 5.6 秒音频队列溢出 → `abort_voice_session` 解除会话武装 →
+    /// 250ms 宽限过后，遥控器仍在按住产生的 typematic 重复沿被逐条放行
+    /// （约每 320ms 一条），浏览器被刷新。被本钩子吞下的沿 Raw Input 看不到，
+    /// 所以 Raw Input 归因只能在**已经漏出一条**之后重新武装，无法阻止。
+    ///
+    /// 规则：本次按住的 DOWN 沿迄今全部被吞（HOLD_SWALLOWED_ALL）且距上一条
+    /// 被吞的 DOWN 沿不超过该间隔时，后续 DOWN 沿继续吞，直到 UP 沿结束本次
+    /// 按住。与会话/音频状态解耦：音频失败只结束语音，不再放出 F5。
+    /// 取 1500ms：覆盖 Windows 键盘重复延迟上限（1000ms，首个重复沿之前）
+    /// 并留余量；UP 沿丢失时，最多让该间隔内按下的一次实体 F5 被吞。
+    const HOLD_LATCH_MAX_GAP_MS: u64 = 1500;
     /// 遥控器语音键在键盘层的虚拟键码（F5）；宿主进程的按键过滤共用。
     pub(crate) const VK_F5: u32 = 0x74;
 
     static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
     /// 连接建立/重连阶段临时接管 F5。此时遥控器的原生 F5 可能先于 ATVV
     /// 控制通知到达；若放行会触发记事本“插入时间/日期”等前台副作用。
+    /// **只在 Raw Input 监听器绑定到遥控器 HID 设备时生效**（见
+    /// [`link_guard_effective`]）；`Reconnecting` 可无限持续，不能单独作为
+    /// 吞实体键盘 F5 的依据（issue #368）。
     static LINK_GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
     static ARMED_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
     /// 抑制器决策计数（AGENTS.md 功能点日志规范；仅决策线程原子递增，
@@ -66,6 +84,8 @@ mod windows_impl {
     /// DOWN 沿全部被本钩子吞下，2=任一 DOWN 沿已泄漏进 OS。UP 沿只在 1 时
     /// 吞下（VVC 同款：DOWN 漏进 OS 则 UP 必放行）。
     static HOLD_PAIRING: AtomicU32 = AtomicU32::new(0);
+    /// 本次按住最近一条被吞 DOWN 沿的时刻（`now_ms`，0=无）；按住锁存判定用。
+    static LAST_SWALLOWED_DOWN_MS: AtomicU64 = AtomicU64::new(0);
     pub const HOLD_NONE: u32 = 0;
     pub const HOLD_SWALLOWED_ALL: u32 = 1;
     pub const HOLD_LEAKED: u32 = 2;
@@ -84,13 +104,41 @@ mod windows_impl {
         SESSION_ACTIVE.load(Ordering::Relaxed)
     }
 
+    /// 纯判定：按住锁存是否生效（单元测试覆盖）。只有"迄今全吞"的按住才能
+    /// 锁存；已泄漏或配对未知的按住不锁存（其 UP 沿必须放行，见防粘键配对）。
+    pub fn hold_latch_active(hold_pairing: u32, last_swallowed_down_ms: u64, now: u64) -> bool {
+        hold_pairing == HOLD_SWALLOWED_ALL
+            && last_swallowed_down_ms != 0
+            && now.saturating_sub(last_swallowed_down_ms) <= HOLD_LATCH_MAX_GAP_MS
+    }
+
+    fn hold_latched() -> bool {
+        hold_latch_active(
+            HOLD_PAIRING.load(Ordering::Relaxed),
+            LAST_SWALLOWED_DOWN_MS.load(Ordering::Relaxed),
+            now_ms(),
+        )
+    }
+
+    /// `link_guard` 只在 Raw Input 监听器确实绑定到遥控器 HID 设备时生效。
+    ///
+    /// issue #368：`Reconnecting` 是无限退避重试，链路相位本身不能证明遥控器
+    /// 还在场。`key_gate::listener_active()` 由进程唯一的 Raw Input 监听器维护：
+    /// 设备缺位（Awaiting）、HID 接口移除或监听器停止时为 false；启动绑定成功
+    /// 与 `GIDC_ARRIVAL` 重绑时为 true。没有这个设备维度时，LL 钩子只能把实体
+    /// 键盘 F5 当成遥控器 F5 吞掉，故障会持续到用户退出应用。
+    pub fn link_guard_effective(link_guard: bool, remote_present: bool) -> bool {
+        link_guard && remote_present
+    }
+
     fn swallow_ready() -> bool {
         decide(
             VK_F5,
             false,
             session_active(),
             LINK_GUARD_ACTIVE.load(Ordering::Relaxed),
-            armed(),
+            crate::key_gate::listener_active(),
+            armed() || hold_latched(),
             HOLD_NONE,
         )
     }
@@ -169,11 +217,16 @@ mod windows_impl {
     /// UP 沿只按配对状态裁决（会话/武装不参与）：本次按住的 DOWN 沿全部被
     /// 吞下（hold==HOLD_SWALLOWED_ALL）才吞 UP，防"DOWN 泄漏 + UP 吞下"粘键；
     /// 配对未知（钩子中途启动）与已泄漏一律放行 UP（宁可送孤立 UP，不留粘键）。
+    ///
+    /// DOWN 沿的 `link_guard` 必须叠加 `remote_present`：`Reconnecting` 可无限
+    /// 持续，只有 Raw Input 监听器绑定到遥控器 HID 设备时才能把 F5 当成遥控器
+    /// 语音键（issue #368）。
     pub fn decide(
         vk_code: u32,
         is_key_up: bool,
         session: bool,
         link_guard: bool,
+        remote_present: bool,
         armed_now: bool,
         hold_pairing: u32,
     ) -> bool {
@@ -183,7 +236,7 @@ mod windows_impl {
         if is_key_up {
             return hold_pairing == HOLD_SWALLOWED_ALL;
         }
-        session || link_guard || armed_now
+        session || link_guard_effective(link_guard, remote_present) || armed_now
     }
 
     /// 纯状态转移：DOWN 沿裁决后更新配对状态。任一 DOWN 沿泄漏（含 typematic
@@ -225,19 +278,22 @@ mod windows_impl {
             }
             HostSuppressorMessage::F5Up => {
                 let hold = HOLD_PAIRING.swap(HOLD_NONE, Ordering::Relaxed);
+                let remote_present = crate::key_gate::listener_active();
                 let swallow = decide(
                     VK_F5,
                     true,
                     session_active(),
                     LINK_GUARD_ACTIVE.load(Ordering::Relaxed),
+                    remote_present,
                     armed(),
                     hold,
                 );
                 // 功能点日志：F5 边沿级别的吞/放裁决（每语音会话约 2 条），
                 // 首按失败类报障可直接定位"泄漏/等待超时/配对"环节。
                 crate::ble::gatt_note(format!(
-                    "suppressor_ask dir=up swallow={} hold={hold}",
-                    if swallow { 1 } else { 0 }
+                    "suppressor_ask dir=up swallow={} hold={hold} remote_present={}",
+                    if swallow { 1 } else { 0 },
+                    if remote_present { 1 } else { 0 }
                 ));
                 Some(swallow)
             }
@@ -258,12 +314,21 @@ mod windows_impl {
                     }
                     armed_late
                 };
+                // 等待结束后再采样：设备/武装可能在 60ms 内才到达。必须在
+                // LAST_SWALLOWED_DOWN_MS 更新之前计算，避免把本次吞下的沿算进
+                // hold_latched；这样 remote_present/latch_only 反映实际裁决时的状态。
+                let remote_present = crate::key_gate::listener_active();
+                let link_guard =
+                    link_guard_effective(LINK_GUARD_ACTIVE.load(Ordering::Relaxed), remote_present);
+                // 诊断：本条 DOWN 沿是否仅靠按住锁存吞下（会话/建链/武装都已失效）。
+                let latch_only = hold_latched() && !session_active() && !link_guard && !armed();
                 if waited && swallowed {
                     F5_DOWN_WAITED_ARMED_LATE.fetch_add(1, Ordering::Relaxed);
                 }
                 F5_DOWN_SEEN.fetch_add(1, Ordering::Relaxed);
                 if swallowed {
                     F5_DOWN_SWALLOWED.fetch_add(1, Ordering::Relaxed);
+                    LAST_SWALLOWED_DOWN_MS.store(now_ms(), Ordering::Relaxed);
                 } else {
                     F5_DOWN_LEAKED.fetch_add(1, Ordering::Relaxed);
                 }
@@ -271,9 +336,11 @@ mod windows_impl {
                 let next = track_down(hold, swallowed);
                 HOLD_PAIRING.store(next, Ordering::Relaxed);
                 crate::ble::gatt_note(format!(
-                    "suppressor_ask dir=down swallow={} waited_late={} hold={next}",
+                    "suppressor_ask dir=down swallow={} waited_late={} hold={next} latch_only={} remote_present={}",
                     if swallowed { 1 } else { 0 },
-                    if waited && swallowed { 1 } else { 0 }
+                    if waited && swallowed { 1 } else { 0 },
+                    if latch_only && swallowed { 1 } else { 0 },
+                    if remote_present { 1 } else { 0 }
                 ));
                 Some(swallowed)
             }
@@ -302,6 +369,7 @@ mod windows_impl {
             LINK_GUARD_ACTIVE.store(false, Ordering::Relaxed);
             ARMED_UNTIL_MS.store(0, Ordering::Relaxed);
             HOLD_PAIRING.store(HOLD_NONE, Ordering::Relaxed);
+            LAST_SWALLOWED_DOWN_MS.store(0, Ordering::Relaxed);
             VoiceKeySuppressor
         }
     }
@@ -359,13 +427,14 @@ mod windows_impl {
             // 功能点日志：抑制器决策计数快照（自应用启动累计），首按
             // 失败类报障一次日志拉取即可归因（泄漏/等待超时/即时吞下）。
             crate::ble::gatt_note(format!(
-                "suppressor_stats seen={} swallowed={} leaked={} waited_late={} raw_remote_f5={} link_guard={}",
+                "suppressor_stats seen={} swallowed={} leaked={} waited_late={} raw_remote_f5={} link_guard={} remote_present={}",
                 F5_DOWN_SEEN.load(Ordering::Relaxed),
                 F5_DOWN_SWALLOWED.load(Ordering::Relaxed),
                 F5_DOWN_LEAKED.load(Ordering::Relaxed),
                 F5_DOWN_WAITED_ARMED_LATE.load(Ordering::Relaxed),
                 REMOTE_F5_RAW_OBSERVED.load(Ordering::Relaxed),
                 LINK_GUARD_ACTIVE.load(Ordering::Relaxed),
+                crate::key_gate::listener_active(),
             ));
             // 钩子在宿主进程：会话开始请求一次链头 bump（与迁移前等价；
             // 宿主未就绪时为 no-op）。
@@ -399,16 +468,19 @@ pub(crate) use windows_impl::{
 
 #[cfg(all(windows, test))]
 pub use windows_impl::{
-    decide, key_down_from_async_state, track_down, HOLD_LEAKED, HOLD_NONE, HOLD_SWALLOWED_ALL,
+    decide, hold_latch_active, key_down_from_async_state, link_guard_effective, track_down,
+    HOLD_LEAKED, HOLD_NONE, HOLD_SWALLOWED_ALL,
 };
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn only_armed_session_or_link_guard_f5_down_is_swallowed() {
-        // DOWN 沿：非 F5 一律透传；F5 仅在会话、建链保护或设备归因武装时吞。
+        // DOWN 沿：非 F5 一律透传；F5 仅在会话、建链保护（且遥控器设备在位）
+        // 或设备归因武装时吞。
         assert!(!super::decide(
             0x41,
+            false,
             false,
             false,
             false,
@@ -417,6 +489,7 @@ mod tests {
         ));
         assert!(!super::decide(
             0x41,
+            true,
             true,
             true,
             true,
@@ -429,10 +502,31 @@ mod tests {
             false,
             false,
             false,
+            false,
             super::HOLD_NONE
         ));
         assert!(super::decide(
             0x74,
+            false,
+            true,
+            false,
+            false,
+            false,
+            super::HOLD_NONE
+        ));
+        assert!(super::decide(
+            0x74,
+            false,
+            false,
+            true,
+            true,
+            false,
+            super::HOLD_NONE
+        ));
+        // issue #368：相位在保护但遥控器 HID 不在位 → 实体 F5 必须放行。
+        assert!(!super::decide(
+            0x74,
+            false,
             false,
             true,
             false,
@@ -443,18 +537,23 @@ mod tests {
             0x74,
             false,
             false,
-            true,
-            false,
-            super::HOLD_NONE
-        ));
-        assert!(super::decide(
-            0x74,
-            false,
             false,
             false,
             true,
             super::HOLD_NONE
         ));
+    }
+
+    /// issue #368：link_guard 不能在没有遥控器 HID 设备归因来源时继续吞实体
+    /// 键盘 F5。遥控器不在位（Raw Input Awaiting/移除/监听器停止）时，LL 钩子
+    /// 拿不到任何设备维度证据，必须按实体键盘放行；否则无限 Reconnecting 会把
+    /// 实体 F5 永久吞掉。
+    #[test]
+    fn link_guard_requires_the_remote_hid_interface_to_be_present() {
+        assert!(super::link_guard_effective(true, true));
+        assert!(!super::link_guard_effective(true, false));
+        assert!(!super::link_guard_effective(false, true));
+        assert!(!super::link_guard_effective(false, false));
     }
 
     #[test]
@@ -468,10 +567,12 @@ mod tests {
             false,
             false,
             false,
+            false,
             super::HOLD_SWALLOWED_ALL
         ));
         assert!(!super::decide(
             0x74,
+            true,
             true,
             true,
             true,
@@ -484,10 +585,12 @@ mod tests {
             true,
             true,
             true,
+            true,
             super::HOLD_NONE
         ));
         assert!(!super::decide(
             0x41,
+            true,
             true,
             true,
             true,
@@ -555,6 +658,39 @@ mod tests {
         assert!(!super::is_wetype_marker(0x5B, true));
         assert!(!super::is_wetype_marker(0xA2, true));
         assert!(!super::is_wetype_marker(0x74, true));
+    }
+
+    /// 2026-11-06 现场：音频队列溢出中止会话后，按住中的遥控器 F5 重复沿
+    /// 每 ~320ms 漏一条刷新浏览器。按住锁存让"迄今全吞"的按住吞到 UP 沿为止。
+    #[test]
+    fn swallowed_hold_stays_latched_until_gap_expires() {
+        // 全吞的按住、上一条被吞沿在间隔内 → 锁存。
+        assert!(super::hold_latch_active(
+            super::HOLD_SWALLOWED_ALL,
+            10_000,
+            10_040
+        ));
+        assert!(super::hold_latch_active(
+            super::HOLD_SWALLOWED_ALL,
+            10_000,
+            11_500
+        ));
+        // 超过间隔（UP 沿丢失后的实体 F5）→ 不锁存。
+        assert!(!super::hold_latch_active(
+            super::HOLD_SWALLOWED_ALL,
+            10_000,
+            11_501
+        ));
+        // 已泄漏的按住不锁存：其 UP 沿必须放行，继续吞 DOWN 无意义。
+        assert!(!super::hold_latch_active(
+            super::HOLD_LEAKED,
+            10_000,
+            10_040
+        ));
+        // 无按住/配对未知 → 不锁存（实体 F5 不受影响）。
+        assert!(!super::hold_latch_active(super::HOLD_NONE, 10_000, 10_040));
+        // 从未吞过任何沿 → 不锁存。
+        assert!(!super::hold_latch_active(super::HOLD_SWALLOWED_ALL, 0, 40));
     }
 
     #[test]

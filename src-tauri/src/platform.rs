@@ -56,6 +56,16 @@ pub trait PlatformRuntime: Debug + Send + Sync {
         &self,
         target: String,
     ) -> Result<sayall_windows::focus::RecordedPoint, PlatformError>;
+    /// 「学习滚动区域」：等待用户点击目标应用的可滚动内容区。
+    fn learn_scroll_region(
+        &self,
+    ) -> Result<sayall_windows::scroll_region::ScrollRegionTarget, PlatformError>;
+    /// 「测试滚动」：激活目标应用后执行一次翻页并读回结果。
+    fn test_scroll_region(
+        &self,
+        target: String,
+        command: sayall_windows::scroll_region::ScrollCommand,
+    ) -> Result<sayall_windows::scroll_region::ScrollOutcome, PlatformError>;
     /// 预设应用清单（含安装状态）。
     fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo>;
     /// 仿真旅程是否跳过「外部入口（官网 / GitHub）」这两步。
@@ -75,6 +85,9 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     /// 输入法切进当前会话（`ime::ensure_session_ime`），并在选中时尝试立即对齐
     /// 系统输入法（见 `WindowsPlatform::set_voice_input_tool`，2026-10-03）。
     fn set_voice_input_tool(&self, _tool: Option<VoiceInputTool>) {}
+    /// 启动/迁移恢复输入工具：只恢复“按下时兜底切换”的目标，不触发
+    /// “选中即对齐”（`TF_IPPMF_FORSESSION` 会切换整个桌面，Issue #367）。
+    fn restore_voice_input_tool(&self, _tool: Option<VoiceInputTool>) {}
     /// 工具选择后的一次性输入法对齐：本应用窗口失去焦点时调用
     /// （`WindowEvent::Focused(false)`，见 `WindowsPlatform::align_ime_after_tool_selection`）。
     /// 未布防（用户没刚选过工具）时是 no-op。
@@ -129,6 +142,8 @@ pub trait PlatformRuntime: Debug + Send + Sync {
         }
     }
     fn set_enhanced_capture_enabled(&self, _enabled: bool) {}
+    /// 快捷键录入期间临时暂停增强捕获的报告层清键；fail-open，非 Windows 为 no-op。
+    fn set_shortcut_capture_suspension(&self, _suspended: bool) {}
     fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot;
     fn subscribe_button_edges(&self, callback: sayall_windows::button_mapping::ButtonEdgeCallback);
     fn subscribe_button_gestures(
@@ -286,8 +301,22 @@ impl PlatformRuntime for WindowsPlatform {
         WindowsPlatform::learn_focus_point(self, &target)
     }
 
+    fn learn_scroll_region(
+        &self,
+    ) -> Result<sayall_windows::scroll_region::ScrollRegionTarget, PlatformError> {
+        WindowsPlatform::learn_scroll_region(self)
+    }
+
+    fn test_scroll_region(
+        &self,
+        target: String,
+        command: sayall_windows::scroll_region::ScrollCommand,
+    ) -> Result<sayall_windows::scroll_region::ScrollOutcome, PlatformError> {
+        WindowsPlatform::test_scroll_region(self, &target, command)
+    }
+
     fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo> {
-        sayall_windows::app_launcher::probe_preset_apps()
+        sayall_windows::app_launcher::cached_preset_apps().to_vec()
     }
 
     fn launch_app(&self, target: &str) -> Result<(), PlatformError> {
@@ -305,6 +334,10 @@ impl PlatformRuntime for WindowsPlatform {
 
     fn set_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
         WindowsPlatform::set_voice_input_tool(self, tool)
+    }
+
+    fn restore_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
+        WindowsPlatform::restore_voice_input_tool(self, tool)
     }
 
     fn align_ime_after_tool_selection(&self) {
@@ -421,7 +454,13 @@ impl PlatformRuntime for WindowsPlatform {
         WindowsPlatform::set_enhanced_capture_enabled(self, enabled)
     }
 
+    fn set_shortcut_capture_suspension(&self, suspended: bool) {
+        WindowsPlatform::set_shortcut_capture_suspension(self, suspended)
+    }
+
     fn shutdown_for_exit(&self, timeout: std::time::Duration) -> Result<(), PlatformError> {
+        // 先释放应用切换器会话的 Alt（进程结束前必须同步完成），再收尾 BLE。
+        let _ = self.release_app_switcher_for_exit(std::time::Duration::from_millis(800));
         self.shutdown_ble_for_exit(timeout)
     }
 }
@@ -979,6 +1018,7 @@ mod simulation {
                     id: app.id.to_owned(),
                     name: app.name.to_owned(),
                     installed: true,
+                    path: None,
                 })
                 .collect()
         }
@@ -1043,6 +1083,37 @@ mod simulation {
             })
         }
 
+        fn learn_scroll_region(
+            &self,
+        ) -> Result<sayall_windows::scroll_region::ScrollRegionTarget, PlatformError> {
+            // 固定样本：runtime-simulation 断言卡片状态机能落到「已学习」。
+            Ok(sayall_windows::scroll_region::ScrollRegionTarget {
+                control_type: "Document".to_owned(),
+                automation_id: "ci-simulation-scroll".to_owned(),
+                class_name: String::new(),
+                normalized_rect: Some(sayall_windows::focus::NormalizedRect {
+                    x: 0.0,
+                    y: 0.1,
+                    width: 1.0,
+                    height: 0.8,
+                }),
+            })
+        }
+
+        fn test_scroll_region(
+            &self,
+            _target: String,
+            _command: sayall_windows::scroll_region::ScrollCommand,
+        ) -> Result<sayall_windows::scroll_region::ScrollOutcome, PlatformError> {
+            Ok(sayall_windows::scroll_region::ScrollOutcome {
+                method: sayall_windows::scroll_region::ScrollMethod::ScrollPattern,
+                before_percent: Some(10.0),
+                after_percent: Some(90.0),
+                moved: true,
+                at_edge: false,
+            })
+        }
+
         fn voice_hold_hotkey(&self) -> Option<KeyChord> {
             lock(&self.voice_hold_hotkey).clone()
         }
@@ -1052,6 +1123,10 @@ mod simulation {
         }
 
         fn set_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
+            *lock(&self.voice_input_tool) = tool;
+        }
+
+        fn restore_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
             *lock(&self.voice_input_tool) = tool;
         }
 

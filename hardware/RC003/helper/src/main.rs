@@ -80,10 +80,13 @@ mod imp {
     /// RC003 的硬件 token（VID 0x2717 / PID 0x32B8 / REV 00a4），与仓库既有取证一致。
     const RC003_HARDWARE_TOKEN: &str = "vid&012717_pid&32b8_rev&00a4";
 
-    /// 检测到宿主里跑的是上一代 agent 时自动刷新的冷却时间：
-    /// 一台机器一小时内最多自动刷新一次，防"刷新→仍旧→再刷新"的循环。
-    const AGENT_REFRESH_COOLDOWN_SECS: u64 = 3600;
-    /// 冷却时间戳文件名（放运行时目录，跨助手进程重启仍生效）。
+    /// 新 agent build 对的首次刷新最小间隔（2026-11-21）：用于避免多个宿主/多次
+    /// 快速安装在同一时刻连续结束宿主；同一"旧代→内嵌代"组合仍由 `tried` 保证
+    /// 只刷新一次。旧实现的 1 小时全局冷却会把本地升级后的新 build 对也挡住，
+    /// 导致 WUDFHost 长时间停留在旧 agent、遥控器/语音键失效。
+    const AGENT_REFRESH_MIN_INTERVAL_SECS: u64 = 30;
+    /// 自动刷新记录文件名（放运行时目录，跨助手进程重启仍生效）：
+    /// `last_refresh` 供 30 秒最小间隔使用，`tried` 记录已尝试的 build 组合。
     const AGENT_REFRESH_STAMP: &str = "agent-refresh.stamp";
     /// 共享宿主设备节点恢复的冷却时间：`remove-device` 可能耗时 60s 以上并短暂
     /// 中断 RC003 的 HID/ATVV 链路，失败后不能跟着应用的 38 秒重启节奏反复做。
@@ -350,7 +353,8 @@ mod imp {
     /// 合成命令的 from 恒为它，桥（S 行）只下发目标 usage。
     const VOICE_KEY_HID_USAGE: u16 = 0x003E;
 
-    /// agent 允许接管的全部语义按键白名单（语音键 0x003E 明确排除）。
+    /// agent 允许**上报**的语义按键白名单（语音键 0x003E 只作为 clear-only
+    /// 目标由 [`clear_with_voice_key`] 追加，不在此表；否则会产生映射边沿）。
     const TARGET_USAGES: [u16; 13] = [
         0x00F1, 0x0028, 0x0035, 0x004A, 0x004F, 0x0050, 0x0051, 0x0052, 0x0065, 0x0066, 0x007F,
         0x0080, 0x0081,
@@ -726,7 +730,7 @@ mod imp {
                             "gadget",
                             format!("{} 0x{gadget_machine:04X}", machine_name(gadget_machine)),
                         ),
-                        ("image", normalize_display(Path::new(path))),
+                        ("image", display_file_name(Path::new(path))),
                     ],
                 );
                 arch_gate(INJECTOR_MACHINE, *target_machine, gadget_machine)
@@ -1017,9 +1021,9 @@ mod imp {
     ///
     /// 条件：提权（结束 session 0 宿主必需）＋ 宿主代次非空且与内嵌代次不同
     /// ＋ **该"旧代→内嵌代"组合尚未尝试过**（2026-10-14：同一组合只自动刷新
-    /// 一次——刷新后仍不收敛时不再反复结束宿主；原"冷却后无限重试"在报障
-    /// 场景里会退化成"每小时杀一次宿主"）＋ 距上次自动刷新超过冷却时间
-    /// （防抖动，多个宿主/组合之间至少隔一个冷却）。
+    /// 一次——刷新后仍不收敛时不再反复结束宿主）＋ 距上次自动刷新至少 30 秒
+    /// （2026-11-21：旧实现是 1 小时全局冷却，导致新 build 对的首次刷新被挡，
+    /// 升级后 WUDFHost 继续跑旧 agent；30 秒只用于多宿主/连续安装的去抖）。
     fn should_auto_refresh_agent(
         elevated: bool,
         running_build: &str,
@@ -1035,19 +1039,63 @@ mod imp {
             return false;
         }
         match last_refresh_unix {
-            Some(last) => now_unix >= last && now_unix - last >= AGENT_REFRESH_COOLDOWN_SECS,
+            Some(last) => now_unix >= last && now_unix - last >= AGENT_REFRESH_MIN_INTERVAL_SECS,
             None => true,
+        }
+    }
+
+    /// 30 秒最小间隔还剩多久（纯函数，单测覆盖）。
+    ///
+    /// `Some(wait)` = 本次 stale 握手被最小间隔挡住，调用方应在 `wait` 后重试；
+    /// `None` = 已过间隔/没有上次记录/时钟回拨（时钟回拨不自动重试，避免把
+    /// 未来时间戳当成立即到期）。把"重试"放在 `serve_connection` 循环里，而不是
+    /// 依赖 agent 重新发 `[HELLO]`：旧 agent 的 socket 通常会一直保持。
+    fn min_interval_remaining(last_refresh_unix: Option<u64>, now_unix: u64) -> Option<Duration> {
+        let last = last_refresh_unix?;
+        if now_unix < last {
+            return None;
+        }
+        let elapsed = now_unix - last;
+        if elapsed >= AGENT_REFRESH_MIN_INTERVAL_SECS {
+            None
+        } else {
+            Some(Duration::from_secs(
+                AGENT_REFRESH_MIN_INTERVAL_SECS - elapsed,
+            ))
         }
     }
 
     /// 纯决策（可自检）：stale 自动刷新前的独占安全闸（2026-10-14）。
     ///
-    /// 只对"独自承载 RC003"的宿主刷新：共享宿主同时承载用户别的 BLE 设备，
-    /// 结束它会把它们一起弄掉——判据与 `should_restart_host_for_clean_inject`
-    /// 的 members 闸门同源。命不中时跳过且**不写尝试记录**——宿主恢复独占后
-    /// 仍允许该组合的首次自动刷新。
+    /// 只对"独自承载 RC003"的宿主走**结束宿主**刷新：共享宿主同时承载用户别的
+    /// BLE 设备，结束它会把它们一起弄掉——判据与 `should_restart_host_for_clean_inject`
+    /// 的 members 闸门同源。共享宿主改走 `stale_refresh_route` 的设备节点恢复分支，
+    /// **绝不**经过本函数。
     fn should_refresh_stale_agent_host(members: usize, rc003_members: usize) -> bool {
         members == 1 && rc003_members == 1
+    }
+
+    /// 旧代次 agent 的刷新路线（纯决策，单测覆盖）。
+    ///
+    /// - 独占 RC003：结束宿主 → 等新宿主 → 重新注入（既有路径）；
+    /// - 共享宿主且恰好一个 RC003 成员：**不结束宿主**，只移除/重扫 RC003 设备节点，
+    ///   由系统决定是否重建宿主（2026-10-21 真机验证过该动作不误伤鼠标等其它设备）；
+    /// - 其它情况（0 个或多个 RC003 成员）：不猜、不动手，落日志等人工/下一轮。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum StaleRefreshRoute {
+        ExclusiveHost,
+        SharedHostDeviceNode,
+        Skip,
+    }
+
+    fn stale_refresh_route(members: usize, rc003_members: usize) -> StaleRefreshRoute {
+        if should_refresh_stale_agent_host(members, rc003_members) {
+            StaleRefreshRoute::ExclusiveHost
+        } else if members > 1 && rc003_members == 1 {
+            StaleRefreshRoute::SharedHostDeviceNode
+        } else {
+            StaleRefreshRoute::Skip
+        }
     }
 
     fn now_unix() -> u64 {
@@ -1059,7 +1107,7 @@ mod imp {
 
     /// 自动刷新记录（`agent-refresh.stamp`，放运行时目录，跨助手进程重启仍生效）。
     ///
-    /// - `last_refresh_unix`：上次自动刷新时刻（全局冷却用）；
+    /// - `last_refresh_unix`：上次自动刷新时刻（30 秒最小间隔用）；
     /// - `tried`：已尝试过的"旧代→内嵌代"组合（每个组合只自动刷新一次）。
     ///
     /// 兼容旧格式（历史文件只有一个 unix 秒）：只恢复冷却时刻、尝试记录为空——
@@ -1133,6 +1181,24 @@ mod imp {
         Some((members.len(), rc003_members))
     }
 
+    /// 该宿主里目标 RC003 的完整设备实例 ID。**只用于设备节点恢复，绝不进日志**
+    /// （含 HID 路径，属隐私红线）。
+    fn host_rc003_instance_id(pid: u32) -> Option<String> {
+        let scan = enum_hosts().ok()?;
+        scan.entries
+            .iter()
+            .find(|entry| entry.pid == pid && entry.is_rc003)
+            .and_then(|entry| entry.rc003_instance_id.clone())
+    }
+
+    /// 宿主里我们这一代 Gadget 的模块数。共享宿主刷新前用它做防 pid 复用/误伤闸门
+    /// （与 `[ATTACH]` 的 `gadget_maps` 同源）；扫描失败按 0 处理，只跳过不动手。
+    fn host_gadget_maps(pid: u32) -> usize {
+        enum_modules(pid)
+            .map(|modules| resident_taps(&modules).len())
+            .unwrap_or(0)
+    }
+
     /// 结束旧宿主后"新宿主"的选择判据（纯函数，单测 + 自检覆盖）。
     ///
     /// 2026-10-14 现场：两支同型号遥控器同时在线时，若只按"任一新 RC003 宿主"选，可能挑到
@@ -1151,31 +1217,56 @@ mod imp {
 
     /// stale 分支入口：条件满足就后台自动刷新宿主里的 agent（不阻塞连接线程）。
     ///
-    /// 2026-10-14 加固（外部报障"设备约每小时中断一次"复核）：
-    /// - **独占闸门**：共享宿主一律跳过（不写尝试记录，宿主恢复独占后仍可再试）；
-    /// - **每组合一次**：同一"旧代→内嵌代"组合只自动刷新一次，之后只落折叠日志。
-    fn spawn_agent_refresh_if_needed(running_build: &str, host_pid: u32, logger: &Logger) {
+    /// - **独占宿主**：结束旧宿主 → 等新宿主 → 重新注入；
+    /// - **共享宿主**：只移除/重扫 RC003 设备节点，**不结束宿主**；受
+    ///   `DEVICE_RECOVERY_COOLDOWN_SECS` 的 10 分钟设备节点恢复冷却约束；
+    /// - **每组合一次**：同一"旧代→内嵌代"组合只自动刷新一次；
+    /// - **30 秒最小间隔**：未到期时返回 `Some(wait)`，调用方应在 `wait` 后重试；
+    ///   `None` 表示已启动或已跳过（不再重试）。
+    fn spawn_agent_refresh_if_needed(
+        running_build: &str,
+        host_pid: u32,
+        bridge: Option<&AppBridge>,
+        logger: &Logger,
+    ) -> Option<Duration> {
         let Some(dll) = PREPARED_GADGET_DLL.get().cloned() else {
-            return; // 本轮没准备好 DLL（dry-run / 自检路径），不刷新
+            return None; // 本轮没准备好 DLL（dry-run / 自检路径），不刷新
         };
         let dir = dll.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let mut stamp = read_refresh_stamp(&dir);
         let key = refresh_attempt_key(running_build, AGENT_BUILD);
         let already_attempted = stamp.tried.iter().any(|tried| tried == &key);
+        if !is_elevated() || running_build.is_empty() || running_build == AGENT_BUILD {
+            return None;
+        }
+        if already_attempted {
+            log_refresh_skipped_already_attempted(logger, running_build, host_pid);
+            return None;
+        }
+        let now = now_unix();
+        if let Some(wait) = min_interval_remaining(stamp.last_refresh_unix, now) {
+            logger.kv(
+                "[AGENT-REFRESH]",
+                &[
+                    ("phase", "completed".into()),
+                    ("terminal_result", "skipped".into()),
+                    ("reason", "min_interval".into()),
+                    ("wait_ms", wait.as_millis().to_string()),
+                    ("host_pid", host_pid.to_string()),
+                ],
+            );
+            return Some(wait);
+        }
         if !should_auto_refresh_agent(
-            is_elevated(),
+            true,
             running_build,
             AGENT_BUILD,
             already_attempted,
             stamp.last_refresh_unix,
-            now_unix(),
+            now,
         ) {
-            if already_attempted {
-                log_refresh_skipped_already_attempted(logger, running_build, host_pid);
-            }
-            return;
+            return None;
         }
-        // 独占闸门在写记录**之前**：共享宿主跳过时不留痕，宿主变独占后可再刷新。
         let Some((members, rc003_members)) = host_membership(host_pid) else {
             logger.kv(
                 "[AGENT-REFRESH]",
@@ -1186,29 +1277,130 @@ mod imp {
                     ("host_pid", host_pid.to_string()),
                 ],
             );
-            return;
+            return None;
         };
-        if !should_refresh_stale_agent_host(members, rc003_members) {
+        let route = stale_refresh_route(members, rc003_members);
+        if route == StaleRefreshRoute::Skip {
             logger.kv(
                 "[AGENT-REFRESH]",
                 &[
                     ("phase", "completed".into()),
                     ("terminal_result", "skipped".into()),
-                    ("reason", "shared_host".into()),
+                    ("reason", "rc003_members_not_one".into()),
                     ("host_pid", host_pid.to_string()),
                     ("members", members.to_string()),
                     ("rc003_members", rc003_members.to_string()),
                 ],
             );
-            return;
+            return None;
         }
+
+        // 共享宿主分支的全部破坏性动作都走 `recover_shared_host_device_node`：
+        // 只移除/重扫 RC003 节点，**绝不结束宿主**。闸门比独占路径多三项：
+        // 确有我们的 gadget、拿得到 RC003 实例、主程序桥接在 10s 内活着。
+        let mut shared_instance: Option<String> = None;
+        let mut shared_gadget_maps = 0_usize;
+        let bridge_recent = bridge
+            .map(|bridge| {
+                let last = bridge.last_connected_ms();
+                last != 0 && now_ms_u64().saturating_sub(last) <= DEVICE_RECOVERY_BRIDGE_FRESH_MS
+            })
+            .unwrap_or(false);
+        if route == StaleRefreshRoute::SharedHostDeviceNode {
+            let gadget_maps = host_gadget_maps(host_pid);
+            let instance = host_rc003_instance_id(host_pid);
+            let cooldown_elapsed =
+                device_recovery_cooldown_elapsed(read_device_recovery_stamp(&dir), now_unix());
+            // `already_attempted` 传 false：当前组合已在 `should_auto_refresh_agent`
+            // 里判定过（true 会早退），这里只判设备节点恢复自身的闸门。
+            if !should_recover_shared_host_device_node(
+                gadget_maps,
+                instance.is_some(),
+                bridge_recent,
+                false,
+                cooldown_elapsed,
+            ) {
+                let reason = if gadget_maps == 0 {
+                    "shared_host_no_gadget"
+                } else if instance.is_none() {
+                    "shared_host_no_instance"
+                } else if !bridge_recent {
+                    "shared_host_bridge_down"
+                } else {
+                    "shared_host_cooldown"
+                };
+                logger.kv(
+                    "[AGENT-REFRESH]",
+                    &[
+                        ("phase", "completed".into()),
+                        ("terminal_result", "skipped".into()),
+                        ("reason", reason.into()),
+                        ("host_pid", host_pid.to_string()),
+                        ("members", members.to_string()),
+                        ("rc003_members", rc003_members.to_string()),
+                        ("gadget_maps", gadget_maps.to_string()),
+                    ],
+                );
+                return None;
+            }
+            shared_instance = instance;
+            shared_gadget_maps = gadget_maps;
+            // 主程序侧看到 `R 1` 会推迟“捕获失效 → 重启助手”，否则设备节点恢复
+            // 的 60 秒窗口会被 `/end` 打断。
+            if let Some(bridge) = bridge {
+                bridge.push_recovering(true);
+            }
+        }
+
         stamp.last_refresh_unix = Some(now_unix());
         stamp.tried.push(key);
         write_refresh_stamp(&dir, &stamp);
         let logger = logger.fork();
-        let _ = std::thread::Builder::new()
-            .name("sayall-helper-agent-refresh".into())
-            .spawn(move || refresh_agent_in_host(host_pid, &dll, &logger));
+        match route {
+            StaleRefreshRoute::ExclusiveHost => {
+                let _ = std::thread::Builder::new()
+                    .name("sayall-helper-agent-refresh".into())
+                    .spawn(move || refresh_agent_in_host(host_pid, &dll, &logger));
+            }
+            StaleRefreshRoute::SharedHostDeviceNode => {
+                let Some(instance) = shared_instance else {
+                    if let Some(bridge) = bridge {
+                        bridge.push_recovering(false);
+                    }
+                    return None;
+                };
+                let notifier = bridge.map(|bridge| bridge.tx.clone());
+                write_device_recovery_stamp(&dir, now_unix());
+                logger.kv(
+                    "[AGENT-REFRESH]",
+                    &[
+                        ("phase", "requested".into()),
+                        ("mode", "shared_device_node".into()),
+                        ("host_pid", host_pid.to_string()),
+                        ("members", members.to_string()),
+                        ("rc003_members", rc003_members.to_string()),
+                        ("gadget_maps", shared_gadget_maps.to_string()),
+                        ("target_build", AGENT_BUILD.to_string()),
+                    ],
+                );
+                let spawn = std::thread::Builder::new()
+                    .name("sayall-helper-agent-refresh-shared".into())
+                    .spawn(move || {
+                        refresh_agent_in_shared_host(host_pid, &instance, &dll, &logger);
+                        if let Some(tx) = notifier {
+                            let _ = tx.send(BridgeOutbound::Recovering(false));
+                        }
+                    });
+                if spawn.is_err() {
+                    // 起线程失败：恢复标志必须收回，否则主程序会一直等我们。
+                    if let Some(bridge) = bridge {
+                        bridge.push_recovering(false);
+                    }
+                }
+            }
+            StaleRefreshRoute::Skip => unreachable!("skip route returned above"),
+        }
+        None
     }
 
     /// 同一组合已被尝试过：不再自动刷新，只折叠落日志（前 3 条 + 每 30 条一条）。
@@ -1315,6 +1507,53 @@ mod imp {
                     ("phase", "completed".into()),
                     ("terminal_result", "failed".into()),
                     ("stage", "inject".into()),
+                    ("detail", error),
+                ],
+            ),
+        }
+    }
+
+    /// 共享宿主旧代次刷新：只重建 RC003 设备节点，**绝不结束宿主**。
+    /// 失败只落日志；不退回“结束宿主”那条破坏性路径。
+    fn refresh_agent_in_shared_host(
+        old_pid: u32,
+        instance_id: &str,
+        dll: &std::path::Path,
+        logger: &Logger,
+    ) {
+        match recover_shared_host_device_node(old_pid, instance_id, logger) {
+            Ok(new_pid) => match inject_gadget(new_pid, dll, logger) {
+                Ok(injection) => {
+                    std::mem::forget(injection);
+                    SERVED_HOST_PID.store(new_pid, Ordering::Relaxed);
+                    logger.kv(
+                        "[AGENT-REFRESH]",
+                        &[
+                            ("phase", "completed".into()),
+                            ("terminal_result", "passed".into()),
+                            ("mode", "shared_device_node".into()),
+                            ("host_pid", new_pid.to_string()),
+                        ],
+                    );
+                }
+                Err(error) => logger.kv(
+                    "[AGENT-REFRESH]",
+                    &[
+                        ("phase", "completed".into()),
+                        ("terminal_result", "failed".into()),
+                        ("mode", "shared_device_node".into()),
+                        ("stage", "inject".into()),
+                        ("detail", error),
+                    ],
+                ),
+            },
+            Err(error) => logger.kv(
+                "[AGENT-REFRESH]",
+                &[
+                    ("phase", "completed".into()),
+                    ("terminal_result", "failed".into()),
+                    ("mode", "shared_device_node".into()),
+                    ("stage", "recover_device_node".into()),
                     ("detail", error),
                 ],
             ),
@@ -2149,6 +2388,25 @@ mod imp {
             .map(|u| u.to_string())
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    /// 产品路径的清空集合：上报集合 ∪ 语音键（clear-only）。
+    ///
+    /// 语音键 0x003E 在 HID 键盘层是 F5；它不进入 `reportUsages`（不产生映射
+    /// 边沿），但必须在报告层被清掉，否则桌面有焦点时会刷新图标、前台应用会
+    /// 收到 F5。配置了 synth 时 agent 仍优先做槽内替换，清空集合不会覆盖它。
+    ///
+    /// **空上报集合 = 增强捕获关闭**：此时必须返回空 clear（完全恢复原生，
+    /// 不接管语音键），否则用户关掉「全按键支持」后仍会被吞掉 F5。
+    fn clear_with_voice_key(usages: &[u16]) -> Vec<u16> {
+        let mut clear = usages.to_vec();
+        if clear.is_empty() {
+            return clear;
+        }
+        if !clear.contains(&VOICE_KEY_HID_USAGE) {
+            clear.push(VOICE_KEY_HID_USAGE);
+        }
+        clear
     }
 
     /// 令牌用进程内时间 + 计数器拼出来的伪随机值。
@@ -3267,8 +3525,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 fs::copy(gadget_src, &dll).map_err(|e| {
                     let mut s = format!(
                         "复制 Gadget 失败 {} -> {}: {e}",
-                        gadget_src.display(),
-                        dll.display()
+                        display_file_name(gadget_src),
+                        display_file_name(&dll)
                     );
                     if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
                         s.push_str(
@@ -5546,6 +5804,12 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         /// 把日志刷爆；现在只在状态变化或每 `HB_LOG_EVERY` 记一条，
         /// ownership 续约等协议动作不受影响。
         last_hb_log: Option<(Instant, (bool, bool, bool))>,
+        /// 最近一次旧代 agent 握手：非空表示需要刷新；`serve_connection` 的循环在
+        /// 30 秒最小间隔到期后重试，不能只依赖旧 agent 再发 `[HELLO]`。
+        stale_agent_build: Option<String>,
+        stale_agent_host_pid: u32,
+        /// 30 秒最小间隔未到期的下次重试时刻；None = 无待重试。
+        agent_refresh_retry_at: Option<Instant>,
     }
 
     fn now_ms() -> u128 {
@@ -5669,15 +5933,26 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 // 代次核对：宿主里的实例是上一代脚本时，本轮改的逻辑**不会生效**。
                 // 不打这一条，现象是"日志一切正常，但行为还是旧的"——最难查的一类。
                 let build = extract_str(line, "build").unwrap_or_default();
+                let hello_host_pid = hello_pid as u32;
                 if !build.is_empty() && build != AGENT_BUILD {
                     // 旧代 agent 不会自愈（脚本在宿主里只加载一次）：满足提权/独占
-                    // 闸门、冷却与"每组合一次"条件时后台刷新——结束旧宿主、等新
-                    // 宿主、重新注入。
-                    spawn_agent_refresh_if_needed(
-                        &build,
-                        extract_num(line, "pid").unwrap_or(0) as u32,
-                        logger,
-                    );
+                    // 闸门与"每组合一次"条件时后台刷新——结束旧宿主、等新宿主、
+                    // 重新注入。30 秒最小间隔未到时不丢失这次请求：记录待重试，
+                    // 由 `serve_connection` 循环在到期后再次调用。
+                    session.stale_agent_build = Some(build.clone());
+                    session.stale_agent_host_pid = hello_host_pid;
+                    session.agent_refresh_retry_at = None;
+                    if let Some(wait) =
+                        spawn_agent_refresh_if_needed(&build, hello_host_pid, bridge, logger)
+                    {
+                        session.agent_refresh_retry_at = Some(Instant::now() + wait);
+                    }
+                } else {
+                    session.stale_agent_build = None;
+                    session.stale_agent_host_pid = 0;
+                    session.agent_refresh_retry_at = None;
+                }
+                if !build.is_empty() && build != AGENT_BUILD {
                     logger.kv(
                         "[AGENT-STALE]",
                         &[
@@ -5685,13 +5960,13 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                             ("embedded", AGENT_BUILD.to_string()),
                             (
                                 "host_pid",
-                                extract_num(line, "pid").unwrap_or(0).to_string(),
+                                hello_host_pid.to_string(),
                             ),
                             (
                                 "note",
                                 "宿主里跑的是上一代脚本（本轮接管的是旧实例）。\
-                                同一代次组合只自动刷新一次（结束旧宿主 → 等新宿主 → 重新注入）；
-                                共享宿主不刷新（见 [AGENT-REFRESH] reason=shared_host）。\
+                                同一代次组合只自动刷新一次：独占宿主结束旧宿主，\
+                                共享宿主只恢复 RC003 设备节点、不结束宿主。\
                                 若本条持续出现而功能未恢复，可重启机器或以管理员结束该 WUDFHost 进程。\
                                  另一条会因租约过期停清键，不适合做验收判据。"
                                     .into(),
@@ -5742,6 +6017,17 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                                 "ever_renewed",
                                 extract_bool(line, "ever_renewed").to_string(),
                             ),
+                            /* 2026-11-15 报告流活性：与 stat.reports_seen 一起读。
+                            reports_seen=0 时 age 恒为 0（无样本）。 */
+                            (
+                                "last_report_age_ms",
+                                extract_num(line, "last_report_age_ms")
+                                    .unwrap_or(0)
+                                    .to_string(),
+                            ),
+                            /* 2026-11-15：把服务宿主 pid 一并落盘，设备重新枚举后
+                            可以直接对比“助手服务的宿主”有没有跟着换。 */
+                            ("host_pid", target_pid.to_string()),
                             ("stat", stat),
                         ],
                     );
@@ -6321,7 +6607,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 std::process::exit(4);
             }
         };
-        logger.kv("[GADGET]", &[("src", normalize_display(&gadget_src))]);
+        logger.kv("[GADGET]", &[("src", display_file_name(&gadget_src))]);
         if let Err(e) = verify_gadget(&gadget_src, &logger) {
             logger.line(&format!("[STOP] {e}"));
             std::process::exit(6);
@@ -6419,22 +6705,23 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         ),
                     ],
                 );
-                for m in &found {
-                    logger.line(&format!(
-                        "    [TAP] path={}",
-                        normalize_display(Path::new(&m.path))
-                    ));
-                }
                 // 归属核对：只有"从我们的运行时目录加载起来的"那份才可能是我们注入的。
                 // 名字相同但路径在别处 → 别人（或别的工具）也注入了 frida-gadget，明确说出来，
                 // 免得把"接不上"归因成自己的 bug。
                 let root = args.runtime_dir.to_string_lossy().to_ascii_lowercase();
                 for m in &found {
+                    // 不打印完整路径（含用户名/安装目录）；文件名 + 是否在运行时目录 =
+                    // 排障需要的全部信息，具体是哪一份由 SHA-256 证明。
+                    logger.line(&format!(
+                        "    [TAP] path={} in_runtime_dir={}",
+                        display_file_name(Path::new(&m.path)),
+                        m.path.to_ascii_lowercase().starts_with(&root)
+                    ));
                     if !m.path.to_ascii_lowercase().starts_with(&root) {
                         logger.line(&format!(
                             "[WARN] 宿主里的 Gadget 模块不在我们的运行时目录下（{}），\
                              不是本助手注入的那一份；它的令牌必然对不上。",
-                            normalize_display(Path::new(&m.path))
+                            display_file_name(Path::new(&m.path))
                         ));
                     }
                 }
@@ -6824,7 +7111,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     &[
                         ("action", "skip_injection".into()),
                         ("reason", reason.into()),
-                        ("path", normalize_display(&prepared.dll)),
+                        ("path", display_file_name(&prepared.dll)),
                         (
                             "note",
                             "agent 会在 RECONNECT_MS 内自己连回来；连上后会补发 arm/mode/restore"
@@ -6943,7 +7230,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         logger.line(
             "已武装。主程序会动态下发已配置按键；[CONFIG] / [HB] 的 report_usages 是当前实际目标。",
         );
-        logger.line("未列入 report_usages 的按键保持 Windows 原生行为；语音键不参与本链路。");
+        logger.line("未列入 report_usages 的按键保持 Windows 原生行为；语音键只进入 clear 集合（清掉 F5、不上报边沿），合成配置存在时仍优先槽内替换。");
         logger.line(&format!(
             "心跳（[HB]）只在状态变化或每 30 秒记一条（避免把日志刷爆）；Ctrl+C 或直接关掉本窗口结束\
              （会先给 agent 发 disarm；即使来不及，agent 也会在 {LEASE_MS} ms 租约到期后自行停止清键）。\
@@ -6978,6 +7265,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             config_sent: false,
             target_ack: None,
             last_hb_log: None,
+            stale_agent_build: None,
+            stale_agent_host_pid: 0,
+            agent_refresh_retry_at: None,
         };
         let mut last_hb_warn = Instant::now();
         // 是否曾经接到过**已鉴权**的 agent。注意不能用 `session.authenticated`：
@@ -7425,6 +7715,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         config_sent: false,
                         target_ack: None,
                         last_hb_log: None,
+                        stale_agent_build: None,
+                        stale_agent_host_pid: 0,
+                        agent_refresh_retry_at: None,
                     };
                     if let Ok(mut guard) = shared.lock() {
                         // 续约线程用的是 clone。Windows 的 `TcpStream::try_clone`
@@ -7633,10 +7926,15 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         targets: &BridgeCaptureTargets,
         synth: Option<(u16, u16)>,
     ) -> io::Result<()> {
-        // 清空集合 = 上报集合 ∪ 哨兵键。哨兵键把"清空到底有没有生效"变成外部可观测的实验
+        // 清空集合 = 上报集合 ∪ 语音键（clear-only） ∪ 哨兵键。语音键不产生映射边沿，
+        // 但必须清掉原生 F5；哨兵键把"清空到底有没有生效"变成外部可观测的实验
         // （详见 `--canary-usage` 的说明）。产品路径下目标来自主程序；无主程序时由
         // 调用方显式传入历史三键默认值，agent 自身默认保持空集合（fail-open）。
         let mut clear = targets.usages.clone();
+        // 只在增强捕获开启（report 非空）时追加语音键；关闭时必须保持空 clear。
+        if !clear.is_empty() {
+            clear = clear_with_voice_key(&clear);
+        }
         for usage in canary {
             if !clear.contains(usage) {
                 clear.push(*usage);
@@ -7758,11 +8056,12 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         token: &str,
         targets: &BridgeCaptureTargets,
     ) -> io::Result<()> {
+        let clear = clear_with_voice_key(&targets.usages);
         let line = format!(
             "{{\"type\":\"targets\",\"token\":\"{token}\",\"generation\":{},\"report\":[{}],\"clear\":[{}]}}\n",
             targets.generation,
             usages_json(&targets.usages),
-            usages_json(&targets.usages)
+            usages_json(&clear)
         );
         write_socket_line(stream, &line)
     }
@@ -7899,6 +8198,29 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             if let Some(d) = deadline {
                 if Instant::now() >= d {
                     return; // 主循环会打 [TIMEUP] 并收尾
+                }
+            }
+
+            /* 30 秒最小间隔挡住的 stale 刷新不能丢：旧 agent 的 socket 通常保持，
+            不会重新发 `[HELLO]`。在 30 秒到期后从当前循环重试一次。 */
+            if let Some(build) = session.stale_agent_build.clone() {
+                let retry_due = session
+                    .agent_refresh_retry_at
+                    .map(|at| Instant::now() >= at)
+                    .unwrap_or(false);
+                if retry_due {
+                    session.agent_refresh_retry_at = None;
+                    if let Some(wait) = spawn_agent_refresh_if_needed(
+                        &build,
+                        session.stale_agent_host_pid,
+                        bridge,
+                        logger,
+                    ) {
+                        session.agent_refresh_retry_at = Some(Instant::now() + wait);
+                    } else {
+                        session.stale_agent_build = None;
+                        session.stale_agent_host_pid = 0;
+                    }
                 }
             }
 
@@ -8698,6 +9020,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         config_sent: false,
                         target_ack: None,
                         last_hb_log: None,
+                        stale_agent_build: None,
+                        stale_agent_host_pid: 0,
+                        agent_refresh_retry_at: None,
                     };
                     let quiet = Logger::new(None);
                     let stop = Arc::new(AtomicBool::new(false));
@@ -9390,6 +9715,21 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             ),
         );
 
+        // 23d) 语音键 clear-only（2026-11-12 报障：桌面图标被 F5 刷新）。
+        //      语音键只能进 clear 集合，不能进 report；canary 统计必须排除它。
+        check(
+            "内嵌 agent：语音键 clear-only 与 canary 排除",
+            AGENT_JS.contains("var VOICE_KEY_HID_USAGE = 0x003E;")
+                && AGENT_JS.contains("voice_clear_hits")
+                && AGENT_JS.contains("if (toClear[ci] === VOICE_KEY_HID_USAGE) continue;")
+                && AGENT_JS.contains("voice:clear n="),
+            format!(
+                "has_voice_constant={} has_canary_skip={}",
+                AGENT_JS.contains("var VOICE_KEY_HID_USAGE = 0x003E;"),
+                AGENT_JS.contains("if (toClear[ci] === VOICE_KEY_HID_USAGE) continue;"),
+            ),
+        );
+
         // 23c) agent 代次必须与内嵌脚本一致，否则 [AGENT-STALE] 形同虚设：
         //      hello 里报的代次永远对不上，或者反过来永远对得上（两边都忘了改）。
         check(
@@ -9554,6 +9894,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                                 config_sent: false,
                                 target_ack: None,
                                 last_hb_log: None,
+                                stale_agent_build: None,
+                                stale_agent_host_pid: 0,
+                                agent_refresh_retry_at: None,
                             };
                             let quiet = Logger::new(None);
                             let stop = Arc::new(AtomicBool::new(false));
@@ -9810,6 +10153,18 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
     }
 
+    /// 日志里的文件身份：只保留文件名。
+    ///
+    /// 完整路径含用户名或安装目录（例如从下载目录直接运行的 Gadget），属
+    /// `LOGGING.md` 隐私红线；需要区分“哪一份二进制”时用 SHA-256——它已经在
+    /// `[VERIFY]` / `[DLL]` 里逐字记录，文件名足够回答“加载的是哪一个”。
+    fn display_file_name(p: &Path) -> String {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    }
+
     /// 默认 Gadget 位置：按顺序试若干候选，**并把选中的路径交给调用方记录**。
     /// 不打印路径的话，"找不到 / 找到的是另一个" 都会变成需要反查的谜题。
     ///
@@ -9848,14 +10203,14 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// 架构单列一项检查与一行日志：SHA 已经隐含锁定架构，但把 machine 打进日志才能一眼
     /// 看出"手上这份是哪个架构"——Issue #206 的排查正是卡在缺这一行证据上。
     fn verify_gadget(path: &Path, logger: &Logger) -> Result<(), String> {
-        let bytes =
-            fs::read(path).map_err(|e| format!("读取 Gadget 失败 {}: {e}", path.display()))?;
+        let bytes = fs::read(path)
+            .map_err(|e| format!("读取 Gadget 失败 {}: {e}", display_file_name(path)))?;
         let digest = sha256_hex(&bytes);
         let machine = pe_machine_from_bytes(&bytes);
         logger.kv(
             "[VERIFY]",
             &[
-                ("file", normalize_display(path)),
+                ("file", display_file_name(path)),
                 ("size", bytes.len().to_string()),
                 ("sha256", digest.clone()),
                 ("expected", GADGET_SHA256.to_string()),
@@ -10042,7 +10397,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// 注意：**不要**因此自动 disarm 旧实例——产品路径下"宿主里是上一代脚本"是常态
     /// （升级应用后宿主往往还活着），旧脚本照样能正确清三键，自动解除反而会把
     /// 升级后的捕获打断成"必须重启才恢复"。
-    const AGENT_BUILD: &str = "2026-10-23.release-hold";
+    const AGENT_BUILD: &str = "2026-11-15.report-liveness";
     /// 锁定文件在编译期内联。三重作用：
     /// 1) **缺失即编译失败**：锁定文件被删/路径写错，构建直接报错，不会产出"看起来正常、
     ///    实际没登记完整性"的二进制（本常量写错路径时已实测触发编译错误）；
@@ -10576,13 +10931,26 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     #[cfg(test)]
     mod agent_refresh_tests {
         use super::{
-            format_refresh_stamp, parse_refresh_stamp, refresh_attempt_key,
-            should_auto_refresh_agent, should_refresh_stale_agent_host, AgentRefreshStamp,
-            AGENT_REFRESH_COOLDOWN_SECS,
+            format_refresh_stamp, min_interval_remaining, parse_refresh_stamp, refresh_attempt_key,
+            should_auto_refresh_agent, should_refresh_stale_agent_host, stale_refresh_route,
+            AgentRefreshStamp, StaleRefreshRoute, AGENT_REFRESH_MIN_INTERVAL_SECS,
         };
 
         #[test]
-        fn refresh_only_when_stale_elevated_and_outside_cooldown() {
+        fn min_interval_remaining_schedules_a_retry_after_30s() {
+            let now = 1_000_000_u64;
+            assert_eq!(min_interval_remaining(None, now), None);
+            assert_eq!(
+                min_interval_remaining(Some(now - 29), now),
+                Some(std::time::Duration::from_secs(1))
+            );
+            assert_eq!(min_interval_remaining(Some(now - 30), now), None);
+            // 时钟回拨：未来记录不当作立即到期，也不自动重试。
+            assert_eq!(min_interval_remaining(Some(now + 1), now), None);
+        }
+
+        #[test]
+        fn refresh_new_build_pair_even_within_the_old_one_hour_cooldown() {
             let now = 1_000_000_u64;
             // 代次一致 / 提权不足 / 代次未知：都不刷新。
             assert!(!should_auto_refresh_agent(true, "a", "a", false, None, now));
@@ -10596,13 +10964,22 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             assert!(should_auto_refresh_agent(
                 true, "old", "new", false, None, now
             ));
-            // 冷却内：不刷新；冷却外：刷新。
+            // 回归用例：距上次刷新 6 分钟（旧实现 3600 秒冷却会挡住）。
+            assert!(should_auto_refresh_agent(
+                true,
+                "old",
+                "new",
+                false,
+                Some(now - 6 * 60),
+                now
+            ));
+            // 30 秒去抖：29 秒内不刷新，30 秒整刷新。
             assert!(!should_auto_refresh_agent(
                 true,
                 "old",
                 "new",
                 false,
-                Some(now - (AGENT_REFRESH_COOLDOWN_SECS - 1)),
+                Some(now - (AGENT_REFRESH_MIN_INTERVAL_SECS - 1)),
                 now
             ));
             assert!(should_auto_refresh_agent(
@@ -10610,7 +10987,16 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 "old",
                 "new",
                 false,
-                Some(now - AGENT_REFRESH_COOLDOWN_SECS),
+                Some(now - AGENT_REFRESH_MIN_INTERVAL_SECS),
+                now
+            ));
+            // 时钟回拨：记录在未来时不刷新。
+            assert!(!should_auto_refresh_agent(
+                true,
+                "old",
+                "new",
+                false,
+                Some(now + 1),
                 now
             ));
         }
@@ -10618,9 +11004,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         #[test]
         fn same_build_pair_is_never_refreshed_twice() {
             // 2026-10-14：同一"旧代→内嵌代"组合只自动刷新一次——刷新后仍不
-            // 收敛时不再等冷却反复结束宿主（原行为会变成每小时杀一次宿主）。
+            // 收敛时不再反复结束宿主；`tried` 记录是唯一判据。
             let now = 1_000_000_u64;
-            let long_after = now + AGENT_REFRESH_COOLDOWN_SECS * 24;
+            let long_after = now + 3600;
             assert!(!should_auto_refresh_agent(
                 true, "old", "new", true, None, long_after
             ));
@@ -10632,7 +11018,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 Some(now),
                 long_after
             ));
-            // 没有尝试记录时仍按冷却节奏走（阳性对照：不能把开关写死成"永不刷新"）。
+            // 没有尝试记录时允许（阳性对照：不能把开关写死成"永不刷新"）。
             assert!(should_auto_refresh_agent(
                 true, "old", "new", false, None, now
             ));
@@ -10670,14 +11056,32 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         }
 
         #[test]
-        fn shared_host_is_never_auto_refreshed() {
-            // 硬性安全闸：共享宿主同时承载用户别的 BLE 设备，结束它会一起弄掉
-            // （判据与 should_restart_host_for_clean_inject 的 members 闸门同源）。
+        fn shared_host_is_never_terminated_for_refresh() {
+            // 硬性安全闸：共享宿主同时承载用户别的 BLE 设备，**结束它会一起弄掉**。
+            // 共享宿主改走设备节点恢复（不结束宿主），所以这里只断言“绝不走结束宿主路径”。
             assert!(should_refresh_stale_agent_host(1, 1));
             assert!(!should_refresh_stale_agent_host(2, 1));
             assert!(!should_refresh_stale_agent_host(2, 2));
             assert!(!should_refresh_stale_agent_host(1, 0));
             assert!(!should_refresh_stale_agent_host(0, 0));
+        }
+
+        #[test]
+        fn stale_refresh_route_picks_device_node_for_shared_rc003_host() {
+            // 独占 → 结束宿主（既有路径）；共享且恰有一个 RC003 → 只重建设备节点；
+            // 0/多个 RC003 或 rc003_members 不唯一 → 不猜、不动手。
+            assert_eq!(stale_refresh_route(1, 1), StaleRefreshRoute::ExclusiveHost);
+            assert_eq!(
+                stale_refresh_route(2, 1),
+                StaleRefreshRoute::SharedHostDeviceNode
+            );
+            assert_eq!(
+                stale_refresh_route(3, 1),
+                StaleRefreshRoute::SharedHostDeviceNode
+            );
+            assert_eq!(stale_refresh_route(2, 2), StaleRefreshRoute::Skip);
+            assert_eq!(stale_refresh_route(1, 0), StaleRefreshRoute::Skip);
+            assert_eq!(stale_refresh_route(0, 0), StaleRefreshRoute::Skip);
         }
     }
 
@@ -10902,6 +11306,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 config_sent: false,
                 target_ack: None,
                 last_hb_log: None,
+                stale_agent_build: None,
+                stale_agent_host_pid: 0,
+                agent_refresh_retry_at: None,
             }
         }
 
@@ -11097,7 +11504,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             assert_eq!(VOICE_KEY_HID_USAGE, 0x003E);
             assert!(
                 !TARGET_USAGES.contains(&VOICE_KEY_HID_USAGE),
-                "语音键不能进接管白名单：ATVV 会话走 BLE 层，且合成命令的 from 就是它"
+                "语音键不能进 report 白名单：ATVV 会话走 BLE 层，且合成命令的 from 就是它；它只作为 clear-only 目标"
             );
         }
 
@@ -11124,6 +11531,34 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             assert!(message.contains("kind=ConnectionRefused"));
             assert!(message.contains("os=Some(10061)"));
             assert!(message.contains("elapsed_ms=37"));
+        }
+    }
+
+    #[cfg(test)]
+    mod voice_key_clear_tests {
+        use super::*;
+
+        #[test]
+        fn clear_set_includes_voice_key_without_duplicates() {
+            // 空上报集合 = 增强捕获关闭：不接管语音键，完全恢复原生 F5。
+            assert_eq!(clear_with_voice_key(&[]), Vec::<u16>::new());
+            assert_eq!(
+                clear_with_voice_key(&[0x00F1, 0x0080, 0x0081]),
+                vec![0x00F1, 0x0080, 0x0081, VOICE_KEY_HID_USAGE]
+            );
+            let already_present = vec![0x00F1, VOICE_KEY_HID_USAGE, 0x0080];
+            assert_eq!(clear_with_voice_key(&already_present), already_present);
+        }
+
+        #[test]
+        fn dynamic_report_set_never_contains_voice_key() {
+            // 产品路径：report 只含映射键，clear 额外追加语音键。若把 0x3E
+            // 误加进 report，会带来一次假的映射边沿（且与 ATVV 语音会话重叠）。
+            let report = vec![0x0028, 0x0066];
+            let clear = clear_with_voice_key(&report);
+            assert!(clear.contains(&VOICE_KEY_HID_USAGE));
+            assert!(!report.contains(&VOICE_KEY_HID_USAGE));
+            assert!(clear.starts_with(&report));
         }
     }
 
@@ -11285,6 +11720,21 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 with_var.starts_with("%ProgramData%") || with_var.is_empty(),
                 "{with_var}"
             );
+        }
+
+        #[test]
+        fn log_file_identity_never_carries_parent_paths() {
+            // 2026-11-15 现场：从下载目录直接运行的 Gadget 把安装目录写进了
+            // [GADGET] / [VERIFY]。文件名 + SHA-256 足够识别二进制，父路径不得落盘。
+            assert_eq!(
+                display_file_name(Path::new(r"D:\downloads\wireless mic\frida-gadget.dll")),
+                "frida-gadget.dll"
+            );
+            assert_eq!(
+                display_file_name(Path::new("frida-gadget.dll")),
+                "frida-gadget.dll"
+            );
+            assert_eq!(display_file_name(Path::new("")), "unknown");
         }
 
         #[test]

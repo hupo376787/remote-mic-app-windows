@@ -24,6 +24,8 @@
 | 增强按键能力（按键页） | 全按键支持 | `ButtonsPage.vue` |
 | 同一设置在连接页的入口 | 支持更多输入工具 | `ConnectionPage.vue` |
 | 按键配置 | 自定义按键功能 / 按键映射 | `ButtonsPage.vue` |
+| 更高版本写入的未知按键动作（2026-11-11） | 动作摘要显示「不支持的动作（来自更新版本）」；当前版本只保留、不执行；编辑时第一次选择只解除保护，再次选择才替换。配置结构版本不降级，未知字段随文件 round-trip | `src/lib/bridge.ts`（`actionSummary` / `isKnownButtonAction`）、`ButtonsPage.vue` |
+| Windows 应用切换器（按键页「系统与媒体」） | 「切换应用」；卡片显示 `Alt + Tab`；悬停提示「切换应用：用左、右键选择，按“确定”确认，返回取消」。会话内方向键 / 确定 / 返回只操作系统切换器，15 秒无操作自动取消（对齐 Mac `Command+Tab` 临时会话，平台动作换成 Alt+Tab）；旧的一次性 `Alt+Tab` 绑定保留可执行。按键页、组合动作页与键位方案的预设芯片统一只显示按键组合，功能描述只作悬停提示；`Win + D`/`Win + L`/`Win + S`/`Win + Shift + S` 保存后摘要也显示 `Win`，不显示「左 Win」或「右 Win」。组合动作里的 `Alt + Tab` 也启动应用切换器会话（运行时按 Alt+Tab 识别）；键位方案复用共享清单的 `app_switcher` 动作。组合动作步骤在会话启动后立即完成，建议把 `Alt + Tab` 放在最后一步，避免后续步骤在切换器打开时继续发送按键 | `src/lib/shortcut-presets.ts`、`ButtonsPage.vue`、`MacrosPage.vue`、`src/lib/bridge.ts`（`actionSummary`）、`sayall-windows::app_switcher` |
 | 虚拟声卡端点 | CABLE Input / CABLE Output（经典 2 通道驱动）；CABLE In 16 Ch（3.3.1.7 起的新版 16 通道驱动，渲染端） | VB-Audio 官方名称；界面文案只说“选择带『推荐』标记的 CABLE 设备”，不硬编码单独一个名字（2026-10-02 现场教训） |
 | 第三方语音工具 Vokie | Vokie；官网 vokie.com；说明文案“流式显示，智能整理，不占用输入法”（Vokie 官方口径，原样引用） | `VOKIE_HOMEPAGE_URL`（`src/lib/bridge.ts`）、`ConnectionPage.vue` |
 | 推荐页（侧栏，2026-10-18） | 侧栏与页面标题统一为「推荐」；英文为 Picks（对齐 Mac 补充页标题）。页面正文、筛选项、商品名与详情全部来自官网 `https://sayall.app/recommendations/`，不在本地维护推荐文案。英文设置下使用 `/en/recommendations/` 与 Mac 同款英文固定文案（Picks / Loading page… / This page is temporarily unavailable. Open the website or try again later. / Open website / Retry / Back） | `src/navigation.ts`、`RecommendationsPage.vue`、`RECOMMENDATIONS_URL` |
@@ -32,9 +34,10 @@
 | 语音音量（连接页「语音设备」卡） | 增益；读数写“12 dB”；说明“0 dB 保持原始音量；数值越大声音越响，也会放大环境噪声。建议先从 6–12 dB 开始。”（对齐 Mac `audio.gain.*`） | `ConnectionPage.vue`、`AppSettings.gain_db` |
 | 常用语（会员能力：按键动作 + 浮层面板） | 常用语；动作名「打开常用语」；缺私有组件时已保存的绑定显示「打开常用语（当前不可用）」；失败提示按原因分叉（见 §7 2026-10-15 条） | `src/lib/bridge.ts`（`actionSummary`）、`ButtonsPage.vue`、`SettingsPage.vue`；面板内文案在私有组件 |
 | 启动行为第二项（设置页「通用」） | 启动时自动打开主面板（对齐 Mac `about.preferences.open_main_window_at_launch`）；悬停提示“关闭后普通启动仅保留托盘入口；更新完成后仍会显示主面板。”；新装与老配置默认开启（2026-10-19 用户定稿「照 Mac 原样」）；通用模块不显示行副标题 | `SettingsPage.vue`、`AppSettings.open_window_at_launch` |
-| 应用语言（设置页「通用」，2026-10-24） | 应用语言；三档「跟随系统」「简体中文」「English」；通用模块不显示行副标题；持久化 `application_language`（`system` / `zh-Hans` / `en`，对齐 Mac `AppLanguage`）；**全界面**跟随语言即时切换：侧栏、六个页面、向导 ①–⑦、弹窗、错误文案、托盘菜单与窗口标题；英文术语对齐 Mac（Routines / Full-key support / Doubao / WeType / App Language / System Default） | `SettingsPage.vue`、`AppSettings.application_language`、`src/lib/language.ts`、`src/lib/i18n.ts`、`src-tauri/src/lib.rs`（`apply_native_language`） |
+| 应用语言（设置页「通用」，2026-10-24） | 应用语言；三档「跟随系统」「简体中文」「English」；通用模块不显示行副标题；持久化 `application_language`（`system` / `zh-Hans` / `en`，对齐 Mac `AppLanguage`）；**全界面**跟随语言即时切换：侧栏、六个页面、向导 ①–⑧、弹窗、错误文案、托盘菜单与窗口标题；英文术语对齐 Mac（Routines / Full-key support / Doubao / WeType / App Language / System Default） | `SettingsPage.vue`、`AppSettings.application_language`、`src/lib/language.ts`、`src/lib/i18n.ts`、`src-tauri/src/lib.rs`（`apply_native_language`） |
 | 更新完成提示（启动时一次性） | 标题「无线麦已更新」、正文「已成功更新到版本 {版本号}。」、按钮「好」（对齐 Mac `update.completed.*`，原样移植）；只在“本次启动前刚完成更新”时出现一次 | `UpdateCompletedDialog.vue`、`launch_state.rs` |
 | 组合动作（侧边栏页 + 按键页动作分组） | 组合动作；步骤类型写「打开应用」「等待应用」「单键或快捷键」「聚焦输入框」「聚焦学习过的输入框」「打开网址」「执行已有组合动作」（对齐 Mac `macro.step.*`；「系统与媒体动作」不再作为新步骤提供，旧数据仍可显示与执行）；终态写「组合动作执行成功」「组合动作已执行，但无法确认第三方 App 的结果」「组合动作已取消」「组合动作执行超时」等（对齐 Mac `macro.status.execution.*`） | `MacrosPage.vue`、`ButtonsPage.vue`、`src/lib/bridge.ts`（`macroActionLabel` / `macroTerminalLabel` / `macroStepSummary`） |
+| 注册应用选择器（按键页 / 组合动作页 / 「聚焦与翻页」页面的「添加应用」弹窗） | 标题写「选择应用」；两个入口写「本机扫描」「程序选择」；确认按钮写「添加应用」；清空写「取消选择」；已加入应用库的条目显示「已添加」；单选锁定提示「已选择应用。要重新选择，请先取消下方已选择的应用。」。已选择区域只显示名称和来源，不显示路径；空态不显示路径说明；左下角不显示确认提示。一次只能选择一个应用 | `RegisteredAppsDialog.vue`、`src/lib/i18n/en/common.ts` |
 
 `Remote Mic` 仅用于历史兼容标识、代码标识符与既有发布资产，不出现在新文案里。
 型号名只允许在 `remoteModelLabel` 定义一次，其他地方引用它（2026-10-01 教训：连接页
@@ -52,18 +55,22 @@
 | 组合动作 | Routine / Routines | 内容与动作单数；侧栏、页面标题、库标题用 Routines |
 | 连接 | Connection / Connect | 侧栏用 Connection；页面标题按 Mac `connection.page.title` 用 Connection & Voice；按钮动作「连接」用 Connect |
 | 推荐 | Picks / Recommended | 页面/侧栏用 Picks；设备徽标用 Recommended |
-| 权限 | Permissions | 侧栏用 Permissions；页面标题按 Mac `permissions.page.title` 用 Permissions & Privacy |
+| 权限 | Permissions | 设置页分组标题用 Permissions（2026-10-31 起不再是独立侧栏页） |
+| 诊断与日志 | Diagnostics & Logs | 设置页分组标题；诊断摘要、日志目录与问题反馈都在此分组 |
 | 按键映射页标题 | Button Mapping | 对齐 Mac `button_mapping.page.title` |
+| 聚焦与翻页（原「APP 适配」） | Focus & Scrolling / Focus/Scroll | 侧栏与页面标题；英文窄侧栏用 Focus/Scroll；文案对齐 Mac PR #1040（2026-11-14） |
 | 设置 | Settings / Set Up | 页面/侧栏用 Settings；向导阶段用 Set Up |
 | 全按键支持 | Full-key support | 句首大写，其余小写 |
 | 遥控器语音键 | Voice Button | 遥控器上的语音键；相关句子用 voice button |
 | 按住说话快捷键（输入工具触发键） | Voice Trigger Key / voice shortcut | 对齐 Mac `connection.voice_key_mode.title` / `onboarding.voice_tool.*` |
+| 切换应用（按键动作） | Switch Apps | 对齐 Mac `shortcut.preset.app_switcher`；卡片显示 `Alt + Tab` |
 | 单击 / 双击 | Single Press / Double Press | 遥控器按键触发方式；鼠标单击仍用 click |
 | 上一曲 / 下一曲 | Previous track / Next track | 对齐 Mac |
 | 小米蓝牙语音遥控器 2 / 2 Pro | Xiaomi Bluetooth Voice Remote 2 / 2 Pro | 包含「语音」与版本后缀 |
 | 豆包输入法 / 微信输入法 | Doubao / WeType | 对齐 Mac |
 | 应用语言 / 跟随系统 | App Language / System Default | 「简体中文」保持中文原生写法 |
 | 登录时自动启动 / 启动时自动打开主面板 | Launch at login / Open main window at launch | 对齐 Mac `about.preferences.*` |
+| 选择应用 / 本机扫描 / 程序选择 / 添加应用 / 取消选择 | Choose App / Local Scan / Program / Add App / Clear Selection | 单选应用弹窗；「已添加」为 Added |
 
 ## 3. 术语红线
 
@@ -71,6 +78,11 @@
 报告层、HID / HID 路径、宿主（WUDFHost）、助手 / Helper、提权、计划任务、Raw Input、
 ATVV、GATT / BLE / 无线电、内核 / 驱动、进程 / 端口 / 边沿、会话代次、队列 / 采样 / 帧、
 状态机、白名单、令牌、结构化日志字段名。
+
+例外（2026-11-05，用户指定与 Mac 文案一致）：「回眸 → 本地 Agent 访问」卡片必须出现
+「访问令牌」「MCP」。理由：用户要在生成的配置里保管一个只显示一次的字符串，并把它粘到
+对应 AI 工具里；换词会让 Mac 与 Windows 两份说明对不上。该卡片之外仍不得出现「令牌」，
+端口、进程、助手 / Helper、注入、提权等机制词在任何位置都不出现。
 
 **用户必须知情的内容照写，但说结果、不说机制**：
 
@@ -626,7 +638,8 @@ ATVV、GATT / BLE / 无线电、内核 / 驱动、进程 / 端口 / 边沿、会
   记录，不需要重复学习。执行时走同一条“打开应用 + 聚焦”实现；两边都不提供
   “测试输入框 / 测试打开与聚焦”入口。
 - 2026-10-24（个人中心，对齐 Mac `statisticsPage`，用户要求；同日二次修正）：
-  侧栏不显示版本号。最底部入口未登录显示「个人中心」，已登录只显示邮箱 `@` 前最多 10 个字符
+  侧栏不显示版本号（2026-10-31 起改为品牌区显示版本号，见该日条目）。
+  最底部入口未登录显示「个人中心」，已登录只显示邮箱 `@` 前最多 10 个字符
   （不足 10 个完整显示），完整邮箱仍只在会员页显示；图标使用与托盘、窗口同源的应用 logo
   （默认水彩鸭 / 几何鸭，随设置切换）。
   页面标题「个人中心」，右上为绿色状态文字「数据仅存本机」（非按钮，12 semibold 胶囊，
@@ -638,7 +651,8 @@ ATVV、GATT / BLE / 无线电、内核 / 驱动、进程 / 端口 / 边沿、会
   同一个官网链接。」，按钮「复制链接」，结果「链接已复制」/「链接复制失败」；二维码在本机
   静态生成，不请求二维码服务。侧栏不提供「分享」入口。
   其下四项 KPI：「累计按键次数」「累计语音时长」「本周按键」「最长单次语音」，计数单位「次」；
-  累计语音使用「33 分钟 12 秒」这类中文单位，单次语音使用 `m:ss` / `h:mm:ss`。左栏标题
+  累计语音使用「33分12秒」这类紧凑中文单位，「分」「秒」与「次」同为 12px 强调色
+  （2026-11-06 用户要求，见该日条目），单次语音使用 `m:ss` / `h:mm:ss`。左栏标题
   「排行榜」，两段为「常用快捷键 / 动作」「实体按键排行」；右栏「使用日历」+「单次语音时长排行」；
   三个排行各最多 10 条，空状态「还没有可展示的数据。」，语音空状态
   「完成一次语音输入后，这里会显示本机排行。」。
@@ -672,7 +686,7 @@ ATVV、GATT / BLE / 无线电、内核 / 驱动、进程 / 端口 / 边沿、会
   「记录和关联的录音将一起移到回收站，不会影响已经输入到目标应用中的文字。」；无录音时说明
   「记录将移到回收站，不会影响已经输入到目标应用中的文字。」；仅录音条目说明
   「录音将移到回收站，不会影响其他记录。」。读取失败「读取回眸记录失败：…」+「重试」。
-  应用内不出现 Agent 访问、云同步等入口；原始录音只保存在本机，不自动上传。
+  页底「本地 Agent 访问」默认关闭；开启后由用户逐个授权 AI 客户端本机只读查看记录（只读、不上传、可随时撤销）；云同步不提供。原始录音只保存在本机，不自动上传。
 - 2026-10-27：「全按键支持 / 支持更多输入工具」的「开着但没生效」提示拆成两句（issue #291）。
   通用情形保持原文「{名称}还没有生效，正在自动重试；如果一直不恢复，请把开关关掉再打开。」；
   当后端说明**助手反复启动不起来**（`captureUnavailable=startup_failing`）时改为
@@ -684,3 +698,181 @@ ATVV、GATT / BLE / 无线电、内核 / 驱动、进程 / 端口 / 边沿、会
   改由助手自己换端口解决（`holder=other_program` 也回退），不再作为提示内容。
   写法边界：不出现端口、进程、助手、驱动（术语红线照旧）；读不到原因时退回通用句，不做猜测。
   落点：`captureInactiveText`（`src/lib/capture-switch.ts`）、英译 `src/lib/i18n/en/lib.ts`。
+- 2026-10-31（设置页吸收权限页 + 侧栏紧凑化；对照 Mac PR #803）：
+  侧栏不再有「权限」入口，顺序为「按键、组合动作、推荐、连接、回眸、设置」，个人中心固定在底部；
+  侧栏宽 136px，导航为图标在左、文字在右的紧凑横排，顶部品牌区为 44px 应用图标 +
+  「SayAll」+ 版本号，底部账号入口上方一条分隔线。
+  权限状态、诊断摘要、日志目录与问题反馈统一放在「设置」页，分组标题为「权限」「诊断与日志」；
+  问题反馈位于「诊断与日志」下。英文为 `Permissions` / `Diagnostics & Logs`。
+  旧版本持久化的 `sayall.activePage = permissions` 升级后落到「设置」，不落回默认页。
+- 2026-11-05：首次设置向导新增第④步「全按键支持」说明与开启引导（用户要求；位置在语音设备
+  之后、输入工具之前）。文案：标题「开启全按键支持」；说明「开启后，遥控器上的所有按键都能
+  设置自定义功能，包括 Windows 默认收不到的返回 / 音量+ / 音量−。」；页首有一条明显的
+  「建议开启」强调条，说明「开启后，返回 / 音量+ / 音量− 才能自定义；豆包语音输入也需要它。」；
+  开关标签「全按键支持」
+  （文字在左、开关在右，沿用 §4）；关闭态「现在不开启也可以继续；以后可以在“按键”页随时打开。」；
+  开启态「已开启。返回 / 音量+ / 音量− 现在也能自定义。」；三条须知「开启时 Windows 会弹出授权
+  窗口，请选择“是”。」「只读取这支遥控器的按键，不收集其他内容。」「个别游戏带有防作弊保护，
+  玩这类游戏前建议先关闭全按键支持。」；读取失败「读取全按键支持状态失败；可以重新进入这一步，
+  或先继续。」。**开启会同步打开同一个设置的另一个入口「支持更多输入工具」，豆包输入法的语音键
+  依赖它**；说明页与开启确认弹窗必须显示同一句（共用 `src/lib/capture-switch.ts` 的
+  `CAPTURE_MORE_INPUT_TOOLS_NOTE`）：「开启后会同时打开“支持更多输入工具”；只有打开它，才能用
+  豆包输入法进行语音输入。」。**这一步不参与门禁**：全按键支持是可选增强，基础语音与普通按键不依赖系统授权；
+  拒绝授权或 ARM64 不可用时必须能继续。不可用时开关置灰并写「这台电脑暂不支持全按键支持，
+  其他按键不受影响。」。开关仍遵守 2026-10-10 的三态与失败文案规则（失败句名称用「全按键支持」）。
+  落点：`src/onboarding/steps/FullKeyStep.vue`、`src/pages/OnboardingPage.vue`、
+  `src/onboarding/flow.ts`、`src/onboarding/panel.ts`、`src-tauri/src/onboarding.rs`。
+  诊断块的步骤顺序随之变为八步（`n/8`）；`Testing/WindowsOnboardingWizard.md` 中的原第④–⑦步
+  依次后移为第⑤–⑧步，2026-10-05 等历史条目里的步骤号保持当时含义。
+- 2026-11-05（向导第①步第 5 条文案，Andy 指定）：改为「选中「小米蓝牙语音遥控器」，等待配对
+  完成，列表里找不到设备时，打开高级设置或者点开「显示所有设备」。」。英文同步为
+  `Select Xiaomi Bluetooth Voice Remote and wait for pairing to finish. If it is not listed,
+  open Advanced settings or select Show all devices.`；真机验收手册同句同步。落点：
+  `src/onboarding/steps/WelcomeStep.vue`、`src/lib/i18n/en/onboarding.ts`。
+- 2026-11-05（按键页「切换应用」，对齐 Mac `Command+Tab` 会话）：原「系统与媒体」中的一次性
+  `Alt+Tab` 预设改为动作「切换应用」（卡片仍显示 `Alt + Tab`）。触发后打开系统切换器，
+  左/右选择、OK 确认、返回取消；再次触发或 TV 前进一项；15 秒无操作自动取消。悬停提示写
+  「切换应用：用左、右键选择，按“确定”确认，返回取消」；英文 `Switch Apps`。旧的一次性
+  `Alt+Tab` 绑定不受影响，重新选择预设即升级为会话。落点：`src/lib/shortcut-presets.ts`、
+  `ButtonsPage.vue`、`src/lib/bridge.ts`、`src/lib/i18n/en/lib.ts`；平台实现见
+  `crates/sayall-windows/src/app_switcher.rs`。
+- 2026-11-06（品牌字体/标题栏/侧栏对齐 Mac，Andy 指定）：侧栏左上角 SayAll 使用 Oxanium SemiBold 16px；
+  设置页左上角「无线麦 SayAll」使用 Oxanium SemiBold 18px（中文按 Segoe UI / 微软雅黑回退）。
+  侧栏宽度按 Mac origin/main 的内容测量口径取 130px，不再固定 136px；主页面与侧栏之间不画竖向分隔线。
+  窗口去掉原生标题栏的 logo 与文字，改为 32px 自定义标题栏；颜色始终使用侧栏的 `--sidebar`，
+  右侧保留最小化/最大化/关闭（关闭仍收进托盘）。侧栏行高 40（上下再留 2px，行距 44）、图标 18、
+  文字 13 semibold、leading 15 / trailing 11；键盘图标按 SF keyboard 的比例保留三行键位，不再压扁；
+  「回眸」使用实心 `text.bubble.fill` 气泡 + 镂空文字，不再画成描边气泡。
+  底部账号入口使用 `person.crop.circle` 的圆环 + 实心头肩，账号区 56 高，上方不画短横线，未登录显示「我的」，
+  已登录显示完整账号本地名并允许换行（对齐 Mac `sidebarAccountTitle` / `SettingsSidebarRow`）。
+  主内容改为浮在侧栏 `--sidebar` 底色上的 10px 圆角面板，右侧/底部各留 8px 露出侧栏色；
+  推荐页子 WebView 的边界同步内缩 8px，并把 `html/body` 背景设为与 `--surface-canvas` 一致的
+  浅色 `#f4f5f8` / 深色 `#15161a`；`body` 最小高度铺满视口，空白区域也填到底部，避免官网白/深灰背景形成色块。
+  回眸的记录/全部应用卡、Agent 授权面板与组合动作左栏卡统一使用设置页的 `--card` 材质；
+  回眸顶部两句隐私说明并成一行（中文不换行），组合动作左栏卡拉到底、页面跟随内容区高度而不是 100vh，
+  内容能放下时页面本身不滚动（按键页、组合动作库/编辑页同样）；组合动作保存成功不再显示底部提示和横线，
+  其他状态改为页头内的轻量行内提示。
+  字体文件 `public/fonts/oxanium-semibold.ttf`，OFL 1.1 许可随包（`public/fonts/OFL.txt`），
+  第三方声明见 `THIRD_PARTY_NOTICES.md`。
+
+- 2026-11-06（个人中心累计语音 KPI，Andy 指定）：累计语音时长由「33 分钟 12 秒」改为
+  「33分12秒」紧凑格式，避免数值增长后被省略号截断；「分」「秒」与左侧「次」一致，
+  同为 12px、600 字重、主题强调色，数字与单位间留 5px 间距（与「次」一致），数字仍为 22px。超过 1 小时显示「1小时2分3秒」，
+  不足 1 分钟显示「0分32秒」。落点：`src/lib/profile.ts` 的 `formatVoiceTotalParts`、
+  `src/pages/ProfilePage.vue`。
+
+- 2026-11-06（向导②步「按键通道未就绪」，用户截图报告）：遥控器已连接、语音链路就绪，
+  但系统没有匹配的 HID 按键接口（诊断块 `Raw input: phase=awaiting matched=0`）时，
+  ②步不再写「按键监听正在启动，请稍等一下。」。页脚改为「Windows 还没有识别到这支
+  遥控器的按键通道。打开蓝牙设置重新配对。」；按键行写「先按一下普通按键；仍无反应时，
+  按下面的步骤重新配对。」；下方修复卡标题「没有识别到遥控器的按键通道」，正文给
+  完整步骤：在蓝牙设置里删除这支遥控器 → 按「TV」键 3 秒重新配对 → 仍不行就重启这台
+  电脑（用「重启」，不要用「关机」再开机）。动作按钮放在步骤说明**之前**：1066×800
+  最小窗口下内容区可能只露出卡片上半部分，按钮必须先可见、不需要先滚动。落点：
+  `src/onboarding/flow.ts`、`src/onboarding/steps/RemoteStep.vue`、
+  `src/pages/OnboardingPage.vue`、`src/lib/i18n/en/onboarding.ts`。
+- 2026-11-06（回眸应用名完整显示，用户截图报告）：应用栏 chip 与记录行的应用名不再用省略号截断。
+  chip 按名称自适应宽度（最小 120px、最大 190px），窗口变窄时由 flex 收缩并换行；记录行应用列由
+  126px 调整为 164px，仍超出时换行，不裁字。「全部应用」保持 156px 最小宽度。落点：
+  `src/pages/ReflectionsPage.vue`；回归 `src/pages/reflections-app-name-layout.test.ts`。
+
+- 2026-11-06（回眸录音应用名，用户查问「未知应用」）：语音开始时前台就是无线麦自己
+  （首次设置向导的语音测试、设置页试音）时，录音 manifest 记录应用键与显示名「SayAll」，
+  回眸按「SayAll」分组，不再落到「未知应用」；与个人中心统计的既有口径一致。旧录音
+  manifest 缺应用身份时仍显示「未知应用」，不改写磁盘。落点：
+  `crates/sayall-windows/src/transcript_capture_windows.rs`。
+
+- 2026-11-10（应用添加入口合并与 AppsFolder 补全，用户要求）：按键页与组合动作页不再并列
+  「扫描本机应用 / ＋ 添加应用」两个 chip，统一为一个「添加应用」入口；弹窗保留本机应用扫描，
+  并在页脚增加「选择程序或快捷方式」文件兜底。扫描把 AppsFolder 解析名为绝对 `.exe`/`.lnk`
+  路径的条目，以及 `{已知文件夹 GUID}\...` 条目（`SHGetKnownFolderPath` 解析）转为文件 target；
+  过滤 URL、文档、卸载程序与 `WindowsApps/SystemApps` 内部路径；`shell:AppsFolder\<AUMID>`
+  条目保持原样。按键页手动选一个程序时仍直接绑定当前编辑格（与旧「＋ 添加应用」一致）；
+  扫描多选仍只入应用库、不改绑定。组合动作页与「聚焦与翻页」页面复用同一弹窗。落点：
+  `registered_apps.rs`、`RegisteredAppsDialog.vue`、`ButtonsPage.vue`、`MacrosPage.vue`。
+
+- 2026-11-10（应用选择器改为单选，用户要求；取代同日「扫描多选仍只入应用库」）：弹窗标题
+  「选择应用」，副标题「从本机扫描或手动选择程序。一次只能选择一个应用。」；「本机扫描」
+  「程序选择」两个入口共用一个「已选择」区域。选中任一应用后两个入口锁定，提示
+  「已选择应用。要重新选择，请先取消下方已选择的应用。」，点「取消选择」恢复；底部主按钮
+  「添加应用」确认，未选择或保存中禁用。移除全选、「添加所选」与「已在列表里」过滤；
+  已添加的应用仍可选择并显示「已添加」。确认后按键页写入应用库并绑定当前编辑格，组合动作页
+  选中步骤目标，「聚焦与翻页」页面加入左列；成功提示「已选择：{name}」（无编辑目标时
+  「已添加应用：{name}」）。英文：Choose App / Local Scan / Program / Add App /
+  Clear Selection / Added。落点：`RegisteredAppsDialog.vue`、`ButtonsPage.vue`、
+  `MacrosPage.vue`、`AppsPage.vue`、`src/lib/i18n/en/common.ts`。验收
+  `Testing/WindowsRegisteredApps.md`；浏览器 1200×900 深色英文与浅色中文目视 passed。
+
+- 2026-11-10（应用选择器现场反馈，Andy）：程序选择返回的 `.lnk` 现在与扫描条目一样显示
+  真实图标（`get_application_icon` 在可执行文件提取失败后回退 Shell 图标）；移除左下角
+  确认提示；已选择区域不再显示路径，空态不再显示「选中后会在这里显示名称、来源和路径。」；
+  主按钮由「使用这个应用」改为「添加应用」。扫描列表固定高度并预留滚动条槽位，消除打开
+  弹窗时的高度与横向刷新。英文按钮为 Add App。落点：`RegisteredAppsDialog.vue`、
+  `src-tauri/src/lib.rs`（`get_application_icon`）、`src/lib/i18n/en/common.ts`。
+
+- 2026-11-19（向导②步长时间重连，issue #104）：重连文案不再承诺「最多等约 60 秒」，
+  改为「不需要重新配对；超过约 60 秒仍未恢复时，下方会给出排查步骤」。连续重连满
+  60 秒（或重试次数达到 5 次）且 `raw_input` 仍为 `awaiting`、尚未收到按键时，显示
+  「遥控器还没有真正连上」提示卡：按普通按键 → 关闭手机/电视蓝牙 → 删除设备后按
+  「TV」键约 3 秒重新配对；动作按钮「打开蓝牙设置」「重新扫描」。落点：
+  `src/onboarding/reconnect-guidance.ts`、`src/onboarding/steps/RemoteStep.vue`、
+  `src/lib/i18n/en/onboarding.ts`。
+
+- 2026-11-21（向导连接步骤现场反馈，Andy 指定四项）：
+  ① **向导左下「复制诊断信息」改为「打开日志目录」**（2026-10-05 的复制入口随之移除）。
+     原因是连接失败卡在向导时，诊断块只有状态与计数，看不到逐次连接、GATT 与服务发现
+     细节；这些只在本机日志里。按钮复用设置页同一条 `open_log_directory` 命令（前端
+     不拼路径），成功提示「已打开日志目录；把其中的日志文件发给开发者。」，失败提示
+     「无法打开日志目录，请稍后重试。」；日志落成对 action `open_log_directory`
+     （begin=`unknown` → end=`passed|failed`）。落点：`src/pages/OnboardingPage.vue`、
+     `src/lib/bridge.ts`；原 `src/onboarding/diagnostics-text.ts` 及单测删除。
+  ② **Windows「高级」设备发现的完整路径写进连接页**：第①步第 5 条改为
+     「部分电脑在蓝牙列表里找不到遥控器时，可以打开高级设置：设置 → 蓝牙和其他设备 →
+     设备 → 向下滚动 → 蓝牙设备发现 → 高级；再点「显示所有设备」」；第②步（连接遥控器）
+     显示小卡「找不到遥控器？部分电脑需要打开「高级」」+「如果在蓝牙列表里找不到遥控器，
+     可以打开高级设置：<同一路径>」，列表为空时再补「打开后回到这里点「扫描已配对设备」；
+     添加设备时选择「显示所有设备」」。不再把这条路径写成所有机型都唯一适用。
+  ③ **真的卡住时才提示重置遥控器（2026-11-21 用户澄清）**：第②步只在
+     「已连接但 20 秒仍无按键」或 `raw_input` 为 `awaiting` 时显示「遥控器已连接，但
+     没有收到按键」提示卡；已收到按键后立即撤掉。连续重连满 60 秒/5 次仍没连上时，
+     `raw_input` 为 `awaiting` 的机型由「遥控器还没有真正连上」卡接管（卡内补上
+     「主页 + 菜单」重置），其余重连机型显示「遥控器一直没有连上」重置卡，文案为
+     「应用已经自动重试超过约 60 秒，仍没有建立连接……」。两种情况下「正在自动恢复连接」
+     只保留尝试次数，不再写「不需要重新配对」。**不能仅因为名称是 `MI RC`
+     就提示**——它只用于解释原因（已连接无按键时标题改为「遥控器名称是 MI RC」），
+     仓库本来就把 `MI RC` 列为合法支持名，正常工作也可能这样上报。重置卡步骤：同时
+     长按「主页」+「菜单」重置 → 在 Windows 删除这支遥控器 → 按「TV」约 3 秒重新配对 →
+     回来「重新扫描」并点「连接」。与 `remote.hid_interface_missing` 修复卡同时成立
+     时不重复显示；该修复卡自身也包含重置步骤。判据：`src/onboarding/reset-guidance.ts`
+     与 `src/onboarding/steps/RemoteStep.vue` 的 60 秒/5 次阈值。
+  ④ **「全按键支持」保持语音设备之后；连接页说明先用其他键**：评估过把它前置到连接
+     之前，最终不前置（顺序保持欢迎 → 遥控器 → 语音设备 → 全按键支持 → 输入工具 → 按住
+     说话验证 → 普通按键 → 完成）。连接页按键行下方新增提示：「连接测试请用返回 / 音量+ /
+     音量−以外的键（如主页、OK、方向键）；这三键要等后面开启全按键支持后才能使用。」，
+     收到普通按键后收起。这样用户不会在未开启全按键支持时用返回 / 音量± 判断连接失败，也不必在连接前
+     先弹一次系统授权。落点：`src/onboarding/flow.ts`、`src/onboarding/steps/RemoteStep.vue`、
+     `src/lib/i18n/en/onboarding.ts`；验收手册的步骤号同步更新。
+- 2026-11-21（向导现场反馈第五轮，Andy 逐条指定）：
+  ① 第①步第 5 条改为「选中「小米蓝牙语音遥控器」，等待配对完成，找不到时可以点开「显示所有设备」。
+     部分电脑在蓝牙列表里找不到遥控器时，可以打开高级设置：设置 → 蓝牙和其他设备 → 设备 →
+     向下滚动 → 蓝牙设备发现 → 高级。」；结尾句改为「若配对失败，或遥控器以前配对过别的设备：
+     回到第 4 步重置蓝牙后重新配对。」。
+  ② 第②步「找不到遥控器？部分电脑需要打开「高级」」提示卡只在 `devices.length === 0 &&
+     !scanning`（找不到任何已配对遥控器）时显示；找到设备后整卡收起。卡片与下方设备行之间
+     留 16px 间距，避免贴在一起。
+  ③ 删除连接页按键行下方与页脚重复的「连接测试请用返回…」段落，只保留页脚提示，并改为
+     「连接已就绪。按一下遥控器上的除返回 / 音量+ / 音量−以外的键（如主页、OK、方向键），
+     这三键要等后面开启全按键支持后才能使用，另外不要按语音键。」。
+  ④ 「遥控器名称是 MI RC」重置卡的三步改为：在 Windows 蓝牙设置里删除这支遥控器 →
+     同时长按「主页」+「菜单」直到指示灯快速闪烁，重置遥控器的蓝牙 → 配对完成后回到这里点
+     「重新扫描」，再点设备行右侧的「连接」。
+  ⑤ 日志目录统一：正式应用与仓库内手动诊断启动脚本都写入
+     `%LOCALAPPDATA%\SayAll\Logs\`；根目录旧的 `login-diagnostic-*.log` / `key-gate-watch.log`
+     是历史手动覆盖或外部监视脚本产物，不是应用默认。落点：`LOGGING.md`、
+     `Testing/investigation/start-with-diag.ps1`、`Testing/investigation/start-with-diag.cmd`。
+     英文文案同步 `src/lib/i18n/en/onboarding.ts`；验收手册同步
+     `Testing/WindowsOnboardingWizard.md`。
+- 2026-11-21（向导现场反馈第六轮）：`MI RC` 重置卡的标题由「遥控器名称是 MI RC」改为
+  「遥控器连不上或者一直收不到按键」；触发条件、正文与三步操作不变。落点：
+  `src/onboarding/steps/RemoteStep.vue`、`src/lib/i18n/en/onboarding.ts`、
+  `Testing/WindowsOnboardingWizard.md`。

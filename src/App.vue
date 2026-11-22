@@ -2,6 +2,7 @@
 import type { Component } from "vue";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import Sidebar from "./components/Sidebar.vue";
+import WindowTitleBar from "./components/WindowTitleBar.vue";
 import UpdateCompletedDialog from "./components/UpdateCompletedDialog.vue";
 import {
   APP_ICON_CHANGED_EVENT,
@@ -27,18 +28,33 @@ import {
   loadPersistedPage,
   persistActivePage,
   touchLiveness,
+  type NavigationRequest,
 } from "./navigation";
 import SettingsPage from "./pages/SettingsPage.vue";
+import AppsPage from "./pages/AppsPage.vue";
 import ButtonsPage from "./pages/ButtonsPage.vue";
 import ConnectionPage from "./pages/ConnectionPage.vue";
 import MacrosPage from "./pages/MacrosPage.vue";
 import OnboardingPage from "./pages/OnboardingPage.vue";
-import PermissionsPage from "./pages/PermissionsPage.vue";
 import RecommendationsPage from "./pages/RecommendationsPage.vue";
 import ReflectionsPage from "./pages/ReflectionsPage.vue";
 import ProfilePage from "./pages/ProfilePage.vue";
 
 const activePage = ref<string>(loadPersistedPage() ?? "buttons");
+/** 页面间带参数的导航（APP 适配 ↔ 按键页）；侧栏切换会清空。 */
+const pendingNavigation = ref<NavigationRequest | null>(null);
+function selectPage(page: string): void {
+  pendingNavigation.value = null;
+  activePage.value = page;
+}
+function onNavigate(request: string | NavigationRequest): void {
+  if (typeof request === "string") {
+    selectPage(request);
+    return;
+  }
+  pendingNavigation.value = request;
+  activePage.value = request.page;
+}
 watch(activePage, (page) => {
   persistActivePage(page);
   void refreshAppIcon();
@@ -52,8 +68,8 @@ let updateCheckTimer: ReturnType<typeof setTimeout> | undefined;
 let profileLabelTimer: ReturnType<typeof setInterval> | undefined;
 let initialRuntimeReported = false;
 
-/** 侧栏个人入口：未登录「个人中心」，已登录只显示邮箱 @ 前最多 10 个字符。 */
-const profileLabel = ref("个人中心");
+/** 账号入口（对齐 Mac statistics）：未登录显示「我的」，已登录显示账号完整本地名。 */
+const profileLabel = ref("我的");
 /** 与托盘图标同源；设置页切换后由事件和 5 秒轮询同步到侧栏。 */
 const appIcon = ref<AppIconIdentifier>("faceted-duck");
 
@@ -63,7 +79,7 @@ async function refreshProfileLabel(): Promise<void> {
     profileLabel.value =
       summary.availability === "available"
         ? profileAccountLabel(summary.accountDisplayName)
-        : "个人中心";
+        : "我的";
   } catch {
     // 会员摘要读取失败不打扰主界面；保持上一次文案。
   }
@@ -139,17 +155,41 @@ function handleWindowKeydown(event: KeyboardEvent): void {
 /** 公开页面 + 私有页面（通常为空）的组件表。私有页面缺席时保持原行为。 */
 const pageComponents: Record<string, Component> = {
   buttons: ButtonsPage,
+  apps: AppsPage,
   recommendations: RecommendationsPage,
   macros: MacrosPage,
   connection: ConnectionPage,
   reflections: ReflectionsPage,
-  permissions: PermissionsPage,
   settings: SettingsPage,
   profile: ProfilePage,
   ...privatePageComponents(),
 };
 
 const activeComponent = computed(() => pageComponents[activePage.value] ?? ButtonsPage);
+const activePageProps = computed(() => {
+  const params = pendingNavigation.value?.params;
+  if (activePage.value === "apps") {
+    return { runtime: runtime.value, initialTarget: params?.appTarget ?? null };
+  }
+  if (activePage.value === "buttons" && params?.button && params?.trigger) {
+    return {
+      runtime: runtime.value,
+      initialEditor: { button: params.button, trigger: params.trigger },
+    };
+  }
+  return { runtime: runtime.value };
+});
+
+/**
+ * 只有「我的（个人中心）」常驻（2026-11-06）：它是侧栏里唯一没有录入 / 捕获流程的
+ * 页面，切页保留滚动位置与日历选中项不会带入后台吞键风险；轮询与 ResizeObserver
+ * 由 ProfilePage 自己用 onDeactivated 暂停、onActivated 恢复。
+ *
+ * 按键 / 组合动作 / 连接三页**不能**直接常驻：它们的 onUnmounted 负责
+ * `stopShortcutCapture()`（页面切走时后端仍在录入态会全局吞键，见 MacrosPage 注释），
+ * 要常驻必须先逐页补 onDeactivated 清理（Bugs/2026-11-06-sidebar-switch-label-refresh.md）。
+ */
+const cachedPageNames = ["ProfilePage"];
 
 // 横幅不在"设置"页重复显示（页面内已有完整更新面板）；推荐页由原生子 WebView
 // 覆盖内容区，横幅即使渲染也看不到，直接跳过。
@@ -260,38 +300,45 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <OnboardingPage
-    v-if="showOnboarding"
-    :runtime="runtime"
-    @completed="onOnboardingCompleted"
-  />
-  <div v-else class="app-shell">
-    <Sidebar
-      :active-page="activePage"
-      :profile-label="profileLabel"
-      :app-icon="appIcon"
-      @select="activePage = $event"
+  <div class="window-frame">
+    <WindowTitleBar />
+    <OnboardingPage
+      v-if="showOnboarding"
+      class="window-body"
+      :runtime="runtime"
+      @completed="onOnboardingCompleted"
     />
-    <main class="content">
-      <div v-if="loadError" class="error-banner">{{ t(loadError) }}</div>
-      <div v-if="updateBannerVisible" class="update-banner">
-        <span>{{ t("发现新版本 {version}", { version: updateInfo?.version ?? "" }) }}</span>
-        <button type="button" class="link-button" @click="showUpdatePage">{{ t("查看") }}</button>
-        <button type="button" class="link-button" :aria-label="t('忽略此提醒')" @click="dismissBanner">
-          ×
-        </button>
-      </div>
-      <component
-        :is="activeComponent"
-        :runtime="runtime"
-        @restart-onboarding="onRestartOnboarding"
-        @navigate="activePage = $event"
+    <div v-else class="app-shell window-body">
+      <Sidebar
+        :active-page="activePage"
+        :profile-label="profileLabel"
+        :app-icon="appIcon"
+        :app-version="runtime?.appVersion ?? ''"
+        @select="selectPage"
       />
-    </main>
+      <main class="content">
+        <div v-if="loadError" class="error-banner">{{ t(loadError) }}</div>
+        <div v-if="updateBannerVisible" class="update-banner">
+          <span>{{ t("发现新版本 {version}", { version: updateInfo?.version ?? "" }) }}</span>
+          <button type="button" class="link-button" @click="showUpdatePage">{{ t("查看") }}</button>
+          <button type="button" class="link-button" :aria-label="t('忽略此提醒')" @click="dismissBanner">
+            ×
+          </button>
+        </div>
+        <KeepAlive :include="cachedPageNames">
+          <component
+            :is="activeComponent"
+            v-bind="activePageProps"
+            @restart-onboarding="onRestartOnboarding"
+            @navigate="onNavigate"
+          />
+        </KeepAlive>
+      </main>
+    </div>
+    <UpdateCompletedDialog
+      v-if="updateCompletedVersion"
+      :version="updateCompletedVersion"
+      @close="updateCompletedVersion = null"
+    />
   </div>
-  <UpdateCompletedDialog
-    v-if="updateCompletedVersion"
-    :version="updateCompletedVersion"
-    @close="updateCompletedVersion = null"
-  />
 </template>

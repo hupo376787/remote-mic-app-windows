@@ -18,20 +18,23 @@ describe("Windows navigation", () => {
     const items = navigationItems.filter((item) => publicIds.has(item.id));
     expect(items.map((item) => item.id)).toEqual([
       "buttons",
+      "apps",
       "macros",
       "recommendations",
       "connection",
       "reflections",
-      "permissions",
       "settings",
       "profile",
     ]);
-    expect(items[2].label).toBe("推荐");
-    expect(items[2].icon).toBe("sparkles");
-    expect(items[3].label).toBe("连接");
-    // 2026-10-25 用户指定：回眸紧挨权限上方。
-    expect(items[4].label).toBe("回眸");
-    expect(items[4].icon).toBe("textbubble");
+    // 2026-11-09：聚焦与翻页紧跟在按键之后（对齐 Mac SettingsSection.applications）。
+    expect(items[1].label).toBe("聚焦与翻页");
+    expect(items[1].icon).toBe("apps");
+    expect(items[3].label).toBe("推荐");
+    expect(items[3].icon).toBe("sparkles");
+    expect(items[4].label).toBe("连接");
+    // 2026-10-25 用户指定：回眸紧挨设置上方。
+    expect(items[5].label).toBe("回眸");
+    expect(items[5].icon).toBe("textbubble");
     // 2026-10-02 用户指定：原「关于」页改名「设置」，图标换成 Mac 同款齿轮。
     expect(items[6].label).toBe("设置");
     expect(items[6].icon).toBe("gear");
@@ -70,6 +73,12 @@ describe("active page persistence (webview reload recovery)", () => {
     expect(loadPersistedPage()).toBeNull();
     localStorage.setItem("sayall.activePage", "");
     expect(loadPersistedPage()).toBeNull();
+  });
+
+  it("旧版本的「权限」页迁移到设置页（2026-10-31 权限并入设置）", () => {
+    localStorage.setItem("sayall.activePage", "permissions");
+    // 不能静默落回默认页：用户升级后应停在权限现在所在的位置。
+    expect(loadPersistedPage()).toBe("settings");
   });
 });
 
