@@ -1044,6 +1044,11 @@ impl WindowsPlatform {
         // 工具变了：让仍在跑的旧激活在下一个检查点退出，避免超时后的迟到
         // 切换覆盖新选择（Issue #367 的 readback/迟到激活后续）。
         ime::invalidate_activation_generation();
+        // Windows 听写走独立的 Win+H 瞬时动作，不可继续保留上个工具的
+        // 报告层合成 usage（否则遥控器语音键会同时触发旧热键）。
+        if matches!(tool, Some(VoiceInputTool::WindowsTyping)) {
+            self.set_voice_hold_hotkey(None);
+        }
         *lock(&self.voice_input_tool) = tool;
         let Some(tool) = tool else {
             *lock(&self.ime_align_pending) = None;
