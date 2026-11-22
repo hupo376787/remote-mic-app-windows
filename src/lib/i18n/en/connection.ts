@@ -15,6 +15,16 @@ export default {
     "Shows text live, organizes speech intelligently, does not replace your input method",
   "其他工具": "Other App",
   "自己指定按键": "Choose the key yourself",
+  "Windows 自带语音输入": "Windows Voice Typing",
+  "使用 Win + H，无需第三方输入法": "Uses Win + H; no third-party IME required",
+  "按住遥控器语音键启动 Windows 听写；松开后尝试暂停，最终文字可能稍后出现。":
+    "Hold the remote voice button to start Windows dictation; release to try to pause. Final text may appear shortly afterward.",
+  "按下自动启动 Windows 语音输入；松开后先排空音频，再尝试暂停。Windows 未提供稳定的停止快捷键，若仍在聆听，请点击语音面板麦克风按钮。":
+    "Press to open Windows voice typing. On release, audio drains before an attempt to pause. Windows offers no guaranteed stop hotkey: click the microphone in the Windows voice panel if it is still listening.",
+  "Windows 语音输入的麦克风选 CABLE Output": "Set Windows voice typing microphone to CABLE Output",
+  "在文本框中按住遥控器语音键说话": "Hold the remote voice button while focused in a text field",
+  "松开后确认听写已暂停；若没有暂停，请点击系统语音面板的麦克风":
+    "After releasing, confirm dictation paused; otherwise click the microphone on the Windows voice panel",
   "已自动设置": "Set up automatically",
   "未同步，点左侧卡片重设": "Out of sync. Click the card on the left to reset.",
 

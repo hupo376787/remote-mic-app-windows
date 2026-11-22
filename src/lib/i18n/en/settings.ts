@@ -33,6 +33,13 @@ export default {
   "登录时自动启动": "Launch at login",
   "使用当前用户的 Windows 登录启动项，不需要管理员权限。":
     "Uses the current user's Windows startup entry. Administrator rights are not required.",
+  "开机静默启动（仅托盘）": "Start silently at login (tray only)",
+  "仅通过 Windows 登录启动时隐藏主界面，后台功能正常运行；手动双击和点击托盘仍可打开。":
+    "Hide the main window only when Windows starts SayAll at login. Background features remain active; manual launch and tray click still open the window.",
+  "无法读取开机静默启动设置，请稍后重试。":
+    "Could not load the silent startup setting. Please try again.",
+  "无法保存开机静默启动设置，请稍后重试。":
+    "Could not save the silent startup setting. Please try again.",
   "启动时自动打开主面板": "Open main window at launch",
   "关闭后普通启动仅保留托盘入口；更新完成后仍会显示主面板。":
     "When off, ordinary launches only keep the tray entry; the main window still appears after an update.",
