@@ -36,7 +36,6 @@ import type {
 } from "../lib/bridge";
 import {
   audioPhaseLabel,
-  chordLabel,
   connectRemote,
   connectionPhaseLabel,
   disableRc003Capture,
@@ -58,6 +57,7 @@ import {
   launchVokie,
   openVokieHomepage,
   remoteModelLabel,
+  restoreVoiceInputTool,
   scanPairedRemotes,
   selectAudioEndpoint,
   setGainDb,
@@ -855,6 +855,9 @@ async function refreshVoiceHotkey() {
  * 初始化快捷键设置与输入工具：两者一起读，工具缺失（老配置）时按当前
  * 快捷键推断并落存一次——此后以用户的选择为准（其他工具 + 右 Alt 与
  * 豆包 + 右 Alt 的组合相同，只有落存的工具能把它们区分开）。
+ *
+ * 推断属于“恢复”而不是用户选择：只落存并恢复按下语音键的兜底目标，不触发
+ * 输入法对齐（对齐会切换整个桌面，Issue #367）。
  */
 async function initializeShortcutSettings(): Promise<void> {
   const [chord, storedTool] = await Promise.all([
@@ -871,7 +874,7 @@ async function initializeShortcutSettings(): Promise<void> {
   }
   const derived = deriveToolFromChord(chord);
   voiceInputTool.value = derived;
-  void setVoiceInputTool(derived).catch(() => undefined);
+  void restoreVoiceInputTool(derived).catch(() => undefined);
 }
 
 watch(
@@ -1648,7 +1651,7 @@ onUnmounted(() => {
             <p v-if="capturingVoiceHotkey" class="capture-display voice-hotkey-capture">
               {{
                 voiceCaptureDisplay.length
-                  ? chordLabel({ keys: voiceCaptureDisplay })
+                  ? voiceHoldHotkeyLabel({ keys: voiceCaptureDisplay })
                   : waitingPreheldRelease
                     ? t("检测到仍有按住的按键，请先松开所有按键；松开后即可按新组合，录入将自动开始")
                     : t("请按下你输入工具当前设置的语音键（也可单独按一个修饰键）；按 Esc 取消")

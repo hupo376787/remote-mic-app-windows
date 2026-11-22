@@ -49,7 +49,8 @@
 //! **三键恒在内**（返回 / 音量±，见 [`ALWAYS_CAPTURED_BUTTONS`]）∪ 已配置映射的
 //! 按键——三键若只在"配置了映射"时才接管，"什么都没配"时按下就零事件
 //! （卡片不高亮、向导按键检测也收不到），而其他按键照常高亮，体验自相矛盾
-//! （2026-10-13 现场反馈）。语音键始终排除。
+//! （2026-10-13 现场反馈）。语音键不进入 report 目标集；产品路径只把它作为
+//! clear-only 目标（清掉 F5、不上报边沿），合成配置存在时仍优先槽内替换。
 //!
 //! ## 协议（ASCII 行，`\n` 结尾；助手 → 主程序）
 //!
@@ -104,7 +105,8 @@ use crate::raw_input::{
 
 /// 语音键的 HID 键盘 usage：遥控器语音键同时以键盘 **F5（0x003E）** 上报
 /// （与 key_suppressor 的知识同源）。ATVV 语音会话走 BLE 协议层，不经这个
-/// usage；且它在 Windows 输入流本来就未映射——报告层替换它零损失。
+/// usage；产品路径把它作为 clear-only 目标交给报告层（清掉 F5、不上报边沿），
+/// 有合成配置时仍优先槽内替换——两种处理都零损失。
 pub const VOICE_KEY_HID_USAGE: u16 = 0x003E;
 
 /// 报告层合成**已实测可用**的目标 usage 白名单（2026-09-29）。
@@ -893,11 +895,11 @@ impl Rc003Bridge {
             let mut state = lock(&shared);
             state.phase = BridgePhase::Listening;
         }
+        // 描述文件路径含用户名（`%LOCALAPPDATA%`），只记发布结果不记路径
+        // （LOGGING.md 隐私红线）。
         note(format!(
             "rc003_bridge phase=listening port={port} descriptor={}",
-            file.as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "none".to_string())
+            if file.is_some() { "published" } else { "none" }
         ));
 
         let bridge_sender = sender.clone();
@@ -1053,6 +1055,12 @@ impl Rc003Bridge {
                 .map(|u| format!("0x{u:04X}"))
                 .unwrap_or_else(|| "off".to_owned())
         ));
+    }
+
+    /// 测试用：当前下发给报告层的语音合成目标（`None` = 关闭）。
+    #[cfg(test)]
+    pub(crate) fn voice_synth_usage_for_test(&self) -> Option<u16> {
+        *lock(&self.voice_synth_to)
     }
 
     /// 请求助手**立即**重选宿主（发一行 `R`，无载荷；2026-10-13 现场）。

@@ -1,18 +1,20 @@
+import type { ButtonTrigger, RemoteButton } from "./lib/bridge";
 import { COMBINATION_ACTIONS_ENABLED } from "./lib/feature-flags";
 import { privateFeaturePages, type PrivateFeaturePage } from "./private/feature-pages";
 
 export type PageId =
   | "buttons"
+  | "apps"
   | "recommendations"
   | "macros"
   | "connection"
   | "reflections"
-  | "permissions"
   | "settings"
   | "profile";
 
 export type NavIcon =
   | "keyboard"
+  | "apps"
   | "sparkles"
   | "layers"
   | "link"
@@ -21,6 +23,16 @@ export type NavIcon =
   | "member"
   | "textbubble"
   | "person";
+
+/** 页面间带参数的导航请求；普通侧栏切换仍可直接传字符串页 id。 */
+export interface NavigationRequest {
+  page: string;
+  params?: {
+    appTarget?: string;
+    button?: RemoteButton;
+    trigger?: ButtonTrigger;
+  };
+}
 
 export interface NavigationItem {
   id: string;
@@ -32,6 +44,8 @@ export interface NavigationItem {
 /** 公开页面表。公开构建的侧栏就是它与私有页面注册表（通常为空）的合并结果。 */
 export const publicNavigationItems: NavigationItem[] = [
   { id: "buttons", label: "按键", icon: "keyboard" },
+  // 2026-11-09 对齐 Mac：聚焦与翻页紧跟在按键之后，拥有独立的 App 级作用域。
+  { id: "apps", label: "聚焦与翻页", icon: "apps" },
   // 2026-10-15 组合动作（对齐 Mac 侧边栏「组合动作」条目与层叠方块图标）；
   // 入口显隐跟随 COMBINATION_ACTIONS_ENABLED，隐藏时已绑定动作照常执行。
   ...(COMBINATION_ACTIONS_ENABLED
@@ -40,9 +54,10 @@ export const publicNavigationItems: NavigationItem[] = [
   // 2026-10-25 用户指定：推荐放在连接上方（对齐 Mac）。
   { id: "recommendations", label: "推荐", icon: "sparkles" },
   { id: "connection", label: "连接", icon: "link" },
-  // 2026-10-25 用户指定：回眸紧挨权限上方。
+  // 2026-10-25 用户指定：回眸紧挨设置上方。
   { id: "reflections", label: "回眸", icon: "textbubble" },
-  { id: "permissions", label: "权限", icon: "shield" },
+  // 2026-10-31 权限页并入设置（对齐 Mac `visibleSection(for:)` 的
+  // permissions -> about 映射）：侧栏不再保留独立「权限」入口。
   // 2026-10-02 用户指定：原「关于」页改名「设置」，图标对齐 Mac main
   // SettingsSection.about 的 "gearshape"。
   { id: "settings", label: "设置", icon: "gear" },
@@ -88,15 +103,25 @@ const LIVENESS_STORAGE_KEY = "sayall.livenessHeartbeat";
  * 余量覆盖 WebView 后台节流与轮询单次失败。 */
 const LIVENESS_FRESH_MS = 5_000;
 
+/** 旧页 id 的迁移表（对齐 Mac `visibleSection(for:)`）。 */
+const LEGACY_PAGE_ALIASES: Record<string, string> = {
+  // 2026-10-31：权限内容并入设置页；升级后应停在权限现在所在的位置，
+  // 而不是静默落回默认页。
+  permissions: "settings",
+};
+
 /** WebView 渲染进程崩溃重载会把整个应用重置回默认页（Bugs/2026-09-12），
  * 当前页持久化让恢复后停在用户离开时的页面。存储不可用时静默放弃：
  * 回到默认页不比重载前更差。 */
 export function loadPersistedPage(): string | null {
   try {
     const stored = localStorage.getItem(ACTIVE_PAGE_STORAGE_KEY);
-    return navigationItems.some((item) => item.id === stored)
+    if (!stored) return null;
+    // 私有构建可能仍注册同名页面；只有该 id 不存在时才走旧页迁移。
+    const page = navigationItems.some((item) => item.id === stored)
       ? stored
-      : null;
+      : (LEGACY_PAGE_ALIASES[stored] ?? stored);
+    return navigationItems.some((item) => item.id === page) ? page : null;
   } catch {
     return null;
   }

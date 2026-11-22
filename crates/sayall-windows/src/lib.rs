@@ -13,6 +13,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub mod app_launcher;
+/// Windows 应用切换器（Alt+Tab）临时会话：状态机、I/O 接缝与结束报告。
+/// 产品行为对齐 macOS Command+Tab 会话，平台差异见模块文档。
+pub mod app_switcher;
 #[cfg(windows)]
 mod audio;
 #[cfg(windows)]
@@ -130,6 +133,9 @@ mod reconnect;
 pub mod remote_target;
 #[cfg(windows)]
 mod resource_probe;
+pub mod scroll_region;
+#[cfg(windows)]
+pub mod scroll_region_windows;
 pub mod send_input;
 /// 真实注入运行时（2026-09-06 起 pub：预设注入链路真机验证探针
 /// examples/preset_inject_probe.rs 需复用与映射引擎完全相同的管线）。
@@ -658,11 +664,10 @@ impl Default for WindowsPlatform {
                 macro_runtime::WindowsMacroStepperSource::new(Arc::clone(&injector), {
                     let profiles = Arc::clone(&macro_focus_profiles);
                     Arc::new(move |target: &str| {
-                        profiles
+                        let profiles = profiles
                             .read()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .get(target)
-                            .cloned()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        crate::button_mapping::focus_profile_for_target(&profiles, target)
                     })
                 }),
             );
@@ -794,7 +799,71 @@ pub(crate) fn apply_enhanced_capture_state(
     enabled: bool,
 ) {
     enhanced_capture_enabled.store(enabled, Ordering::Relaxed);
-    rc003_bridge.set_capture_targets(enabled, button_mapping.mappings().mapped_mask());
+    let effective =
+        effective_enhanced_capture(enabled, SHORTCUT_CAPTURE_SUSPENDED.load(Ordering::Relaxed));
+    rc003_bridge.set_capture_targets(
+        effective,
+        if effective {
+            button_mapping.mappings().mapped_mask()
+        } else {
+            0
+        },
+    );
+}
+
+/// 快捷键录入会话期间临时暂停增强捕获（报告层清键）。
+///
+/// 录入时用户在前台配置快捷键，遥控器并不参与；此时必须让内置键盘/外接键盘的
+/// 所有按键原样到达低级键盘钩子。否则增强捕获 agent 可能把同一 `WUDFHost` 里
+/// 笔记本键盘的 Enter / 方向 / Home / 音量等目标 usage 当成遥控器按键清掉
+/// （2026-11-15 现场：内置键盘录入无反应，外接键盘正常，重启后复发）。
+static SHORTCUT_CAPTURE_SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+/// 增强捕获实际是否应向报告层下发清键目标：用户开着、且不在快捷键录入期间。
+fn effective_enhanced_capture(enabled: bool, suspended: bool) -> bool {
+    enabled && !suspended
+}
+
+/// 快捷键录入暂停的平台侧完整语义（可离线单测）。
+///
+/// 与 [`apply_enhanced_capture_state`] 同一个理由：真实 `WindowsPlatform` 会写
+/// `%LOCALAPPDATA%` 描述文件并启动钩子/WASAPI/原始输入线程，不能进单测。本函数
+/// 接收同样的部件，测试可用 `Rc003Bridge::start_in` + 测试注入器验证**真实**
+/// 目标集与语音合成状态的变化，而不是只断言纯函数或源码文本。
+///
+/// 暂停时先关语音合成再清目标：F5 的报告层合成也必须停，否则录入 F5 时 agent
+/// 会把它替换成右 Alt，前端只看到修饰键、永远等不到主键。恢复时按当时保存的
+/// 「按住说话快捷键」重新下发，避免覆盖用户在录入期间改的设置。
+#[cfg(windows)]
+pub(crate) fn apply_shortcut_capture_suspension(
+    suspended: bool,
+    enhanced_capture_enabled: &AtomicBool,
+    button_mapping: &ButtonMappingRuntime,
+    rc003_bridge: &rc003_bridge::Rc003Bridge,
+    voice_hold_hotkey: &Mutex<Option<send_input::KeyChord>>,
+) {
+    SHORTCUT_CAPTURE_SUSPENDED.store(suspended, Ordering::Relaxed);
+    if suspended {
+        rc003_bridge.set_voice_synth(None);
+    }
+    let enabled = enhanced_capture_enabled.load(Ordering::Relaxed);
+    let effective = effective_enhanced_capture(enabled, suspended);
+    rc003_bridge.set_capture_targets(
+        effective,
+        if effective {
+            button_mapping.mappings().mapped_mask()
+        } else {
+            0
+        },
+    );
+    if !suspended {
+        let hotkey = (*lock(voice_hold_hotkey)).clone();
+        let synth_to = hotkey.and_then(|chord| rc003_bridge::voice_synth_target(&chord));
+        rc003_bridge.set_voice_synth(synth_to);
+    }
+    crate::ble::gatt_note(format!(
+        "shortcut_capture_suspend phase=requested terminal_result=pending suspended={suspended} enhanced_capture_enabled={enabled} effective={effective}"
+    ));
 }
 
 impl WindowsPlatform {
@@ -839,6 +908,20 @@ impl WindowsPlatform {
         _timeout: std::time::Duration,
     ) -> Result<(), PlatformError> {
         Ok(())
+    }
+
+    /// 退出前同步释放应用切换器（Alt+Tab）会话，等引擎确认 Alt 已释放。
+    ///
+    /// 必须排在 BLE 收尾之前：`std::process::exit` 不执行析构，只有显式调用
+    /// 才能保证不把按住的 Alt 留在系统键态。无活动会话时立即返回 true。
+    #[cfg(windows)]
+    pub fn release_app_switcher_for_exit(&self, timeout: std::time::Duration) -> bool {
+        self.button_mapping.release_app_switcher_for_exit(timeout)
+    }
+
+    #[cfg(not(windows))]
+    pub fn release_app_switcher_for_exit(&self, _timeout: std::time::Duration) -> bool {
+        true
     }
 
     pub fn test_scroll(
@@ -903,9 +986,41 @@ impl WindowsPlatform {
         *lock(&self.voice_hold_hotkey) = hotkey.clone();
         #[cfg(windows)]
         {
-            let synth_to = hotkey.and_then(|chord| rc003_bridge::voice_synth_target(&chord));
-            self.rc003_bridge.set_voice_synth(synth_to);
+            // 快捷键录入期间只暂停、不重配：录入结束后由 set_shortcut_capture_suspension(false)
+            // 按当时的热键重新下发，避免用户改快捷键导致暂停被意外解除。
+            if !SHORTCUT_CAPTURE_SUSPENDED.load(Ordering::Relaxed) {
+                let synth_to = hotkey.and_then(|chord| rc003_bridge::voice_synth_target(&chord));
+                self.rc003_bridge.set_voice_synth(synth_to);
+            }
         }
+    }
+
+    /// 启动/迁移恢复「你在用的输入工具」：只恢复按下语音键时的兜底切换目标，
+    /// **不做选中即对齐**，也不布防。
+    ///
+    /// Issue #367：启动恢复原先复用 `set_voice_input_tool`，主窗口第一次失焦就会执行
+    /// `scope=tool_select` 的 TSF 激活；`TF_IPPMF_FORSESSION` 的官方语义是
+    /// “Activate this profile for all threads in the current desktop”，会把任务栏、
+    /// 开始菜单、搜索及同桌面其他进程一起切到目标输入法。恢复配置不是用户主动选择，
+    /// 不能触发桌面级切换。
+    pub fn restore_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
+        ime::note_tool_select();
+        Self::apply_restored_voice_tool(&self.voice_input_tool, &self.ime_align_pending, tool);
+        crate::ble::gatt_note(format!(
+            "ime_tool_select action=restored tool={}",
+            ime::tool_label(tool)
+        ));
+    }
+
+    /// 恢复工具时的状态写入：只写目标并清掉待对齐布防，不调用任何 TSF API。
+    /// 抽成关联函数以便单测直接覆盖“恢复不得布防”的语义（Issue #367）。
+    fn apply_restored_voice_tool(
+        tool_slot: &std::sync::Mutex<Option<VoiceInputTool>>,
+        align_pending: &std::sync::Mutex<Option<(VoiceInputTool, std::time::Instant)>>,
+        tool: Option<VoiceInputTool>,
+    ) {
+        *lock(tool_slot) = tool;
+        *lock(align_pending) = None;
     }
 
     /// 更新「你在用的输入工具」：BLE 工作线程在按下语音键时按它决定把哪个输入法
@@ -917,10 +1032,18 @@ impl WindowsPlatform {
     /// （早于应用知情一个 BLE 往返），若按下时系统输入法还不是所选工具，这一按必然
     /// 赶不上切换——表现为"换工具后第一按拉不起"。选中即对齐把该窗口期清零；
     /// 按下时的兜底切换保留（覆盖用户手动改走输入法的情况）。
+    ///
+    /// 注意：这条路径的 `tool_select` 最终使用 `TF_IPPMF_FORSESSION`，会作用于
+    /// **当前桌面的所有线程**（任务栏、开始菜单、搜索及其他进程），不是仅本应用。
+    /// 因此只能由用户显式选择工具触发；启动恢复、旧配置推断与向导暂存必须走
+    /// [`Self::restore_voice_input_tool`]（Issue #367）。
     pub fn set_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
         // 诊断时间基线（2026-10-09）：失败样本全部来自"切完工具、快速切到目标
         // 窗口"，按下时"距选工具多久"由此起算并进 `voice_attempt`。
         ime::note_tool_select();
+        // 工具变了：让仍在跑的旧激活在下一个检查点退出，避免超时后的迟到
+        // 切换覆盖新选择（Issue #367 的 readback/迟到激活后续）。
+        ime::invalidate_activation_generation();
         // Windows 听写走独立的 Win+H 瞬时动作，不可继续保留上个工具的
         // 报告层合成 usage（否则遥控器语音键会同时触发旧热键）。
         if matches!(tool, Some(VoiceInputTool::WindowsTyping)) {
@@ -1202,6 +1325,27 @@ impl WindowsPlatform {
         let _ = enabled;
     }
 
+    /// 快捷键录入会话的临时暂停：**不改用户开关**，只让报告层在录入期间停止清键。
+    ///
+    /// 与 [`Self::set_enhanced_capture_enabled`] 同一套收敛点：恢复时重新下发当前
+    /// 映射的 `mapped_mask()`。录入结束、启动失败、页面取消或应用退出都必须成对
+    /// 调用 `false`；重复调用幂等。非 Windows 为 no-op。
+    pub fn set_shortcut_capture_suspension(&self, suspended: bool) {
+        #[cfg(windows)]
+        apply_shortcut_capture_suspension(
+            suspended,
+            &self.enhanced_capture_enabled,
+            &self.button_mapping,
+            &self.rc003_bridge,
+            &self.voice_hold_hotkey,
+        );
+        #[cfg(not(windows))]
+        {
+            SHORTCUT_CAPTURE_SUSPENDED.store(suspended, Ordering::Relaxed);
+            let _ = suspended;
+        }
+    }
+
     pub fn button_mappings(&self) -> send_input::ButtonMappings {
         self.button_mapping.mappings()
     }
@@ -1242,6 +1386,43 @@ impl WindowsPlatform {
         self.button_mapping
             .learn_focus_point(target)
             .map_err(PlatformError::SendInput)
+    }
+
+    /// UI「学习滚动区域」：等待用户点击目标应用的可滚动内容区。
+    pub fn learn_scroll_region(&self) -> Result<scroll_region::ScrollRegionTarget, PlatformError> {
+        #[cfg(windows)]
+        {
+            scroll_region_windows::learn_scroll_region_for_foreground()
+                .map_err(|error| PlatformError::SendInput(error.to_string()))
+        }
+        #[cfg(not(windows))]
+        {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+    }
+
+    /// UI「测试滚动」：先激活目标应用，再用已保存的区域执行一次翻页。
+    pub fn test_scroll_region(
+        &self,
+        target: &str,
+        command: scroll_region::ScrollCommand,
+    ) -> Result<scroll_region::ScrollOutcome, PlatformError> {
+        #[cfg(windows)]
+        {
+            app_launcher::activate_or_launch(target).map_err(PlatformError::SendInput)?;
+            let _ = app_launcher::wait_for_target_foreground(
+                target,
+                std::time::Duration::from_millis(1200),
+            );
+            let region = self.button_mappings().scroll_regions.get(target).cloned();
+            scroll_region_windows::scroll_foreground(region, command)
+                .map_err(|error| PlatformError::SendInput(error.to_string()))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (target, command);
+            Err(PlatformError::UnsupportedPlatform)
+        }
     }
 
     /// 订阅语义按键边沿（画布高亮数据源）。
@@ -1576,7 +1757,8 @@ fn scan_paired_remotes() -> Result<Vec<PairedRemote>, PlatformError> {
     let devices = futures::executor::block_on(operation.into_future()).map_err(windows_error)?;
 
     let mut remotes = Vec::new();
-    for index in 0..devices.Size().map_err(windows_error)? {
+    let total_paired_count = devices.Size().map_err(windows_error)?;
+    for index in 0..total_paired_count {
         let device = devices.GetAt(index).map_err(windows_error)?;
         let name = device.Name().map_err(windows_error)?.to_string();
         if !is_supported_remote_name(&name) {
@@ -1591,6 +1773,12 @@ fn scan_paired_remotes() -> Result<Vec<PairedRemote>, PlatformError> {
             is_supported_candidate: true,
         });
     }
+    // 只记数量：total > 0 且 supported = 0 = Windows 有配对设备但名称不在支持列表
+    // （现场常见于系统名异常/未初始化）；不记录任何设备名或地址。
+    crate::ble::gatt_note(format!(
+        "ble_scan filter total_paired_count={total_paired_count} supported_count={}",
+        remotes.len()
+    ));
     Ok(remotes)
 }
 
@@ -1920,6 +2108,66 @@ mod tests {
         );
     }
 
+    /// 全按键支持链路测试的无副作用注入器：注入请求直接成功，不碰真实输入。
+    #[cfg(windows)]
+    struct NoopInjector;
+
+    #[cfg(windows)]
+    impl button_mapping::MappingInjector for NoopInjector {
+        fn tap(&self, _chord: &send_input::KeyChord) -> Result<(), String> {
+            Ok(())
+        }
+        fn scroll(
+            &self,
+            _direction: send_input::ScrollDirection,
+            _steps: u16,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn mouse_click(&self, _kind: send_input::MouseClickKind) -> Result<(), String> {
+            Ok(())
+        }
+        fn mouse_move(
+            &self,
+            _direction: send_input::MoveDirection,
+            _distance: u16,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn launch_app(&self, _target: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn focus_frontmost(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn launch_app_and_focus(
+            &self,
+            _target: &str,
+            _profile: Option<&crate::focus::AppFocusProfile>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String> {
+            Ok(crate::focus::RecordedFocusTarget {
+                control_type: "Edit".to_owned(),
+                automation_id: "chat-input".to_owned(),
+                ..Default::default()
+            })
+        }
+        fn learn_focus_point(&self, _target: &str) -> Result<crate::focus::RecordedPoint, String> {
+            Ok(crate::focus::RecordedPoint {
+                x_ratio: 0.5,
+                y_ratio: 0.5,
+                window_width: 1200,
+                window_height: 800,
+                left_offset: Some(600),
+                top_offset: Some(400),
+                right_offset: Some(600),
+                bottom_offset: Some(400),
+            })
+        }
+    }
+
     /// 全按键支持开关的平台侧完整语义（离线复刻 2026-09-28 两次真机回归，
     /// Bugs/2026-09-28-enhanced-capture-targets-never-pushed.md）。
     ///
@@ -1934,65 +2182,6 @@ mod tests {
     #[test]
     fn enhanced_capture_enable_pushes_targets_and_disable_clears() {
         use std::sync::mpsc;
-
-        struct NoopInjector;
-        impl button_mapping::MappingInjector for NoopInjector {
-            fn tap(&self, _chord: &send_input::KeyChord) -> Result<(), String> {
-                Ok(())
-            }
-            fn scroll(
-                &self,
-                _direction: send_input::ScrollDirection,
-                _steps: u16,
-            ) -> Result<(), String> {
-                Ok(())
-            }
-            fn mouse_click(&self, _kind: send_input::MouseClickKind) -> Result<(), String> {
-                Ok(())
-            }
-            fn mouse_move(
-                &self,
-                _direction: send_input::MoveDirection,
-                _distance: u16,
-            ) -> Result<(), String> {
-                Ok(())
-            }
-            fn launch_app(&self, _target: &str) -> Result<(), String> {
-                Ok(())
-            }
-            fn focus_frontmost(&self) -> Result<(), String> {
-                Ok(())
-            }
-            fn launch_app_and_focus(
-                &self,
-                _target: &str,
-                _profile: Option<&crate::focus::AppFocusProfile>,
-            ) -> Result<(), String> {
-                Ok(())
-            }
-            fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String> {
-                Ok(crate::focus::RecordedFocusTarget {
-                    control_type: "Edit".to_owned(),
-                    automation_id: "chat-input".to_owned(),
-                    ..Default::default()
-                })
-            }
-            fn learn_focus_point(
-                &self,
-                _target: &str,
-            ) -> Result<crate::focus::RecordedPoint, String> {
-                Ok(crate::focus::RecordedPoint {
-                    x_ratio: 0.5,
-                    y_ratio: 0.5,
-                    window_width: 1200,
-                    window_height: 800,
-                    left_offset: Some(600),
-                    top_offset: Some(400),
-                    right_offset: Some(600),
-                    bottom_offset: Some(400),
-                })
-            }
-        }
 
         let _gate_lock = key_gate::lock_gate_tests();
         let (sender, _receiver) = mpsc::channel();
@@ -2077,6 +2266,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 2026-11-15 修复的真实桥接级回归：暂停必须清空**实际下发**的目标集并
+    /// 关闭语音合成；恢复必须按当前映射与「按住说话快捷键」重新下发。
+    ///
+    /// 纯函数与源码契约测试证明不了这一点。这里用 `Rc003Bridge::start_in` +
+    /// 测试注入器走与 `WindowsPlatform::set_shortcut_capture_suspension` 相同的
+    /// `apply_shortcut_capture_suspension` 实现，直接读 `BridgeSnapshot` 与桥内
+    /// 合成目标。
+    ///
+    /// `SHORTCUT_CAPTURE_SUSPENDED` 是进程级全局（P2-3）：与 key_gate 测试共用
+    /// 串行锁，并用 drop guard 复位，断言失败也不会把暂停态留给其他用例。
+    #[cfg(windows)]
+    #[test]
+    fn shortcut_capture_suspension_drives_real_bridge_targets_and_synth() {
+        use std::sync::mpsc;
+
+        struct ResetSuspension;
+        impl Drop for ResetSuspension {
+            fn drop(&mut self) {
+                SHORTCUT_CAPTURE_SUSPENDED.store(false, Ordering::Relaxed);
+            }
+        }
+
+        let _gate_lock = key_gate::lock_gate_tests();
+        let _reset = ResetSuspension;
+        SHORTCUT_CAPTURE_SUSPENDED.store(false, Ordering::Relaxed);
+
+        let (sender, _receiver) = mpsc::channel();
+        let dir = std::env::temp_dir().join(format!(
+            "sayall-suspension-bridge-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bridge = rc003_bridge::Rc003Bridge::start_in(dir.clone(), sender);
+        let engine = ButtonMappingRuntime::new(
+            Arc::new(NoopInjector),
+            Arc::new(UsageCounters::default()),
+            Arc::new(Mutex::new(RawInputSnapshot::default())),
+            Arc::new(crate::macro_runtime::MacroRuntime::new(Arc::new(
+                crate::macro_runtime::UnsupportedStepperSource,
+            ))),
+        );
+        let mut mappings = engine.mappings();
+        mappings.enabled = true;
+        mappings.actions.insert(
+            raw_input::RemoteButton::Home,
+            send_input::ButtonActions {
+                long: send_input::ButtonAction::Shortcut {
+                    chord: send_input::KeyChord {
+                        keys: vec![send_input::KeyCode::Escape],
+                    },
+                },
+                ..send_input::ButtonActions::default()
+            },
+        );
+        engine.set_mappings(mappings);
+
+        let enabled = AtomicBool::new(true);
+        let hotkey = Mutex::new(Some(send_input::KeyChord {
+            keys: vec![send_input::KeyCode::RightAlt],
+        }));
+
+        // 先建立「全按键支持已开启 + 语音合成已配置」的真实状态。
+        apply_enhanced_capture_state(&enabled, &engine, &bridge, true);
+        bridge.set_voice_synth(Some(0x00E6));
+        assert_eq!(
+            bridge.snapshot().target_usages,
+            vec![0x004A, 0x0080, 0x0081, 0x00F1],
+            "开态目标集应为 Home + 三键"
+        );
+        assert_eq!(bridge.voice_synth_usage_for_test(), Some(0x00E6));
+
+        apply_shortcut_capture_suspension(true, &enabled, &engine, &bridge, &hotkey);
+        assert!(
+            bridge.snapshot().target_usages.is_empty(),
+            "暂停必须清空真实桥接目标"
+        );
+        assert_eq!(
+            bridge.voice_synth_usage_for_test(),
+            None,
+            "暂停必须关闭语音键报告层合成"
+        );
+
+        apply_shortcut_capture_suspension(false, &enabled, &engine, &bridge, &hotkey);
+        assert_eq!(
+            bridge.snapshot().target_usages,
+            vec![0x004A, 0x0080, 0x0081, 0x00F1],
+            "恢复必须按当前映射重新下发目标"
+        );
+        assert_eq!(
+            bridge.voice_synth_usage_for_test(),
+            Some(0x00E6),
+            "恢复必须按当前按住说话快捷键重配合成"
+        );
+
+        drop(bridge);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn non_windows_host_reports_unsupported_instead_of_fake_devices() {
@@ -2095,5 +2385,70 @@ mod tests {
             Err(PlatformError::UnsupportedPlatform)
         );
         assert_eq!(platform.audio_snapshot().phase, AudioPhase::Unsupported);
+    }
+
+    /// Issue #367：启动/迁移恢复输入工具只能写“按下时兜底切换”的目标，
+    /// 不能留下 `ime_align_pending`——否则主窗口第一次失焦就会用
+    /// `TF_IPPMF_FORSESSION` 切换整个桌面的输入法。
+    #[test]
+    fn shortcut_capture_suspension_only_changes_effective_targets() {
+        assert!(effective_enhanced_capture(true, false));
+        assert!(!effective_enhanced_capture(true, true));
+        assert!(!effective_enhanced_capture(false, false));
+        assert!(!effective_enhanced_capture(false, true));
+    }
+
+    #[test]
+    fn shortcut_capture_suspension_also_mutes_voice_synth() {
+        let source = include_str!("lib.rs");
+        let helper_start = source
+            .find("fn apply_shortcut_capture_suspension(")
+            .expect("suspension helper must exist");
+        let helper_end = source[helper_start..]
+            .find("impl WindowsPlatform {")
+            .map(|offset| helper_start + offset)
+            .expect("suspension helper must end before the platform impl");
+        let block = &source[helper_start..helper_end];
+        assert!(block.contains("set_voice_synth(None)"));
+        assert!(block.contains("voice_synth_target"));
+
+        let method_start = source
+            .find("pub fn set_shortcut_capture_suspension")
+            .expect("suspension method must exist");
+        let method_end = source[method_start..]
+            .find("pub fn button_mappings")
+            .map(|offset| method_start + offset)
+            .expect("suspension method must end before button_mappings");
+        assert!(
+            source[method_start..method_end].contains("apply_shortcut_capture_suspension"),
+            "the platform method must delegate to the tested helper"
+        );
+
+        let hotkey_start = source
+            .find("pub fn set_voice_hold_hotkey")
+            .expect("voice hold hotkey setter must exist");
+        let hotkey_end = source[hotkey_start..]
+            .find("pub fn restore_voice_input_tool")
+            .map(|offset| hotkey_start + offset)
+            .expect("voice hold hotkey setter must end before restore_voice_input_tool");
+        assert!(
+            source[hotkey_start..hotkey_end].contains("SHORTCUT_CAPTURE_SUSPENDED"),
+            "changing the hotkey during capture must not re-enable the synth"
+        );
+    }
+
+    #[test]
+    fn restoring_voice_tool_clears_pending_alignment() {
+        let tool = std::sync::Mutex::new(Some(VoiceInputTool::Wechat));
+        let pending =
+            std::sync::Mutex::new(Some((VoiceInputTool::Wechat, std::time::Instant::now())));
+
+        WindowsPlatform::apply_restored_voice_tool(&tool, &pending, Some(VoiceInputTool::Doubao));
+
+        assert_eq!(*lock(&tool), Some(VoiceInputTool::Doubao));
+        assert!(
+            lock(&pending).is_none(),
+            "恢复工具不得保留待对齐布防，否则失焦会切整个桌面"
+        );
     }
 }

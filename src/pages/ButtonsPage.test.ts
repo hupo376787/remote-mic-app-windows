@@ -48,6 +48,19 @@ vi.mock("../lib/bridge", async (importOriginal) => {
       lastError: null,
     })),
     saveButtonMappings: vi.fn(async (mappings: unknown) => mappings),
+    resolvePresetTarget: vi.fn(async () => null),
+    listPresetApps: vi.fn(async () => [
+      { id: "sayall", name: "无线麦 SayAll", installed: true },
+      { id: "wechat", name: "微信", installed: true },
+      { id: "netease_music", name: "网易云音乐", installed: true },
+      { id: "chrome", name: "Chrome 浏览器", installed: true },
+      { id: "chatgpt", name: "ChatGPT", installed: true },
+      { id: "workbuddy", name: "WorkBuddy", installed: true },
+      { id: "dimagent", name: "DimAgent", installed: true },
+      { id: "vokie", name: "Vokie", installed: true },
+      { id: "notepad", name: "记事本", installed: true },
+      { id: "qq", name: "QQ", installed: true },
+    ]),
     activateAppForLearning: vi.fn(async () => undefined),
     learnFocusTarget: vi.fn(async () => ({
       controlType: "Edit",
@@ -91,6 +104,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     scanRegisteredApps: vi.fn(async () => [
       { name: "Registered Example", path: "shell:AppsFolder\\Example!App" },
     ]),
+    pickCustomApp: vi.fn(async () => null),
     testButtonMapping: vi.fn(async () => ({
       available: true,
       submittedBatches: 1,
@@ -105,7 +119,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
       gestureHandler = handler;
       return () => {};
     }),
-    startShortcutCapture: vi.fn(async () => undefined),
+    startShortcutCapture: vi.fn(async () => []),
     stopShortcutCapture: vi.fn(async () => undefined),
     subscribeShortcutCaptureEdges: vi.fn(async (handler: ShortcutCaptureHandler) => {
       shortcutCaptureHandler = handler;
@@ -198,6 +212,9 @@ import {
   importButtonMappingConfiguration,
   learnFocusPoint,
   learnFocusTarget,
+  listPresetApps,
+  resolvePresetTarget,
+  pickCustomApp,
   saveLockMappingSelection,
   scanPairedRemotes,
   subscribeButtonEdges,
@@ -270,7 +287,10 @@ const runtime: RuntimeSnapshot = {
   },
 };
 
-async function mountPage(model: "rc001" | "rc003" | "unknown" = "rc003"): Promise<VueWrapper> {
+async function mountPage(
+  model: "rc001" | "rc003" | "unknown" = "rc003",
+  initialEditor: { button: "ok"; trigger: "single" | "double" | "long" } | null = null,
+): Promise<VueWrapper> {
   const snapshot =
     model === "rc003"
       ? runtime
@@ -281,7 +301,7 @@ async function mountPage(model: "rc001" | "rc003" | "unknown" = "rc003"): Promis
             connection: { ...runtime.platform.connection, remoteModel: model },
           },
         };
-  const wrapper = mount(ButtonsPage, { props: { runtime: snapshot } });
+  const wrapper = mount(ButtonsPage, { props: { runtime: snapshot, initialEditor } });
   await vi.waitFor(() => {
     if (!edgeHandler || !gestureHandler) throw new Error("事件订阅未完成");
   });
@@ -289,14 +309,21 @@ async function mountPage(model: "rc001" | "rc003" | "unknown" = "rc003"): Promis
   return wrapper;
 }
 
-/** 通过「扫描本机应用」加入 mock 的 Registered Example（自定义应用）。 */
+/** 通过「添加应用」选中 mock 的 Registered Example（自定义应用）。 */
 async function addScannedApp(page: VueWrapper): Promise<void> {
+  if (!page.find(".custom-app-group").exists()) {
+    await page
+      .findAll("button")
+      .find((button) => button.text() === "打开自定义 APP")!
+      .trigger("click");
+    await flushPromises();
+  }
   await page
     .findAll("button")
-    .find((button) => button.text() === "扫描本机应用")!
+    .find((button) => button.text() === "添加应用")!
     .trigger("click");
   await flushPromises();
-  await page.get('input[aria-label="全选当前结果"]').setValue(true);
+  await page.get('input[aria-label="Registered Example"]').setValue(true);
   await page.get(".registered-apps-dialog .primary-button").trigger("click");
   await flushPromises();
 }
@@ -340,6 +367,9 @@ beforeEach(() => {
     automationId: "chat-input",
     className: "RichEdit",
   });
+  vi.mocked(pickCustomApp).mockClear();
+  vi.mocked(pickCustomApp).mockResolvedValue(null);
+  vi.mocked(resolvePresetTarget).mockResolvedValue(null);
   vi.mocked(learnFocusPoint).mockClear();
   vi.mocked(learnFocusPoint).mockResolvedValue({
     xRatio: 0.5,
@@ -483,27 +513,23 @@ function confirmDialog(page: VueWrapper) {
 }
 
 describe("buttons mapping page", () => {
-  it("adds scanned apps to the library without changing button bindings", async () => {
+  it("selecting a scanned app adds it to the library and binds the current button", async () => {
     const wrapper = await mountPage();
     await flushPromises();
     const powerCard = wrapper
       .findAll(".mapping-card")
       .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
     await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
-    await wrapper
-      .findAll("button")
-      .find((button) => button.text() === "扫描本机应用")!
-      .trigger("click");
-    await flushPromises();
-    await wrapper.get('input[aria-label="全选当前结果"]').setValue(true);
-    await wrapper.get(".registered-apps-dialog .primary-button").trigger("click");
-    await flushPromises();
+    await addScannedApp(wrapper);
 
     const saved = vi.mocked(saveButtonMappings).mock.lastCall![0];
     expect(saved.applications).toEqual([
       { name: "Registered Example", path: "shell:AppsFolder\\Example!App" },
     ]);
-    expect(saved.actions.power).toBeUndefined();
+    expect(saved.actions.power?.single).toEqual({
+      type: "open_app",
+      target: "shell:AppsFolder\\Example!App",
+    });
     expect(saved.actions.ok?.single).toEqual({
       type: "shortcut",
       chord: { keys: ["enter"] },
@@ -511,48 +537,75 @@ describe("buttons mapping page", () => {
     wrapper.unmount();
   });
 
-  it("扫描本机应用与添加应用排在其他应用名称之后（2026-10-03 用户要求）", async () => {
+  it("manual program pick adds it to the library and binds the current action", async () => {
+    vi.mocked(pickCustomApp).mockResolvedValueOnce({
+      name: "Custom",
+      path: "C:\\Apps\\Custom.exe",
+    });
     const wrapper = await mountPage();
     await flushPromises();
     const powerCard = wrapper
       .findAll(".mapping-card")
       .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
     await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
-    // 先加一个自定义应用（复用既有扫描流程），保证「其他应用名称」非空。
+    if (!wrapper.find(".custom-app-group").exists()) {
+      await wrapper
+        .findAll("button")
+        .find((button) => button.text() === "打开自定义 APP")!
+        .trigger("click");
+      await flushPromises();
+    }
     await wrapper
       .findAll("button")
-      .find((button) => button.text() === "扫描本机应用")!
+      .find((button) => button.text() === "添加应用")!
       .trigger("click");
     await flushPromises();
-    await wrapper.get('input[aria-label="全选当前结果"]').setValue(true);
-    await wrapper.get(".registered-apps-dialog .primary-button").trigger("click");
+    await wrapper.get(".picker-program-pick").trigger("click");
     await flushPromises();
+    await wrapper.get(".registered-apps-dialog .primary-button").trigger("click");
+    await vi.waitFor(() =>
+      expect(vi.mocked(saveButtonMappings).mock.lastCall?.[0].actions.power?.single).toEqual({
+        type: "open_app",
+        target: "C:\\Apps\\Custom.exe",
+      }),
+    );
+
+    const saved = vi.mocked(saveButtonMappings).mock.lastCall![0] as ButtonMappings;
+    expect(saved.applications).toContainEqual({
+      name: "Custom",
+      path: "C:\\Apps\\Custom.exe",
+    });
+    wrapper.unmount();
+  });
+
+  it("添加应用入口排在其他应用名称之后，且不再拆成扫描和文件两个按钮", async () => {
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    // 先加一个自定义应用（复用扫描流程），保证「目标 APP」非空。
+    await addScannedApp(wrapper);
 
     const section = wrapper
       .findAll(".action-section")
-      .find((item) => item.find(".action-section-title").text() === "打开应用")!;
+      .find((item) => item.find(".action-section-title").text() === "打开 APP")!;
     const chips = section.findAll("button.chip").map((button) => button.text());
     const customIndex = chips.findIndex((text) => text.includes("Registered Example"));
-    const scanIndex = chips.findIndex((text) => text === "扫描本机应用");
-    const addIndex = chips.findIndex((text) => text.includes("添加应用"));
-    expect(customIndex, `自定义应用芯片缺失：${chips.join(" / ")}`).toBeGreaterThanOrEqual(0);
-    expect(scanIndex, "扫描本机应用按钮缺失").toBeGreaterThanOrEqual(0);
-    expect(addIndex, "添加应用按钮缺失").toBeGreaterThanOrEqual(0);
-    // 两个动作入口必须排在所有应用名称（预设 + 自定义）之后。
-    expect(scanIndex, `扫描本机应用排在应用名称之前：${chips.join(" / ")}`).toBeGreaterThan(
-      customIndex,
+    expect(chips).toContain("打开自定义 APP");
+    expect(chips.indexOf("打开自定义 APP")).toBeGreaterThan(
+      chips.indexOf("打开无线麦 SayAll"),
     );
-    expect(addIndex).toBeGreaterThan(scanIndex);
-    // 预设与已添加应用在同一个换行网格里：名字连续排布，二者之间不强制换行。
-    const presetChip = section
-      .findAll("button.chip")
-      .find((button) => button.text() === "打开无线麦 SayAll")!;
-    const customChip = section
-      .findAll("button.chip")
-      .find((button) => button.text().includes("Registered Example"))!;
-    expect(customChip.element.parentElement, "预设与已添加应用应在同一容器内").toBe(
-      presetChip.element.parentElement,
-    );
+    const group = section.find(".custom-app-group");
+    expect(group.exists()).toBe(true);
+    expect(group.find(".target-app-title").text()).toBe("目标 APP");
+    const groupChips = group.findAll("button.chip").map((button) => button.text());
+    expect(customIndex).toBeGreaterThanOrEqual(0);
+    expect(groupChips).toContain("打开 Registered Example");
+    expect(groupChips.at(-1)).toBe("添加应用");
+    // 预设芯片不进入自定义目标组。
+    expect(group.find("button").text()).not.toContain("打开无线麦 SayAll");
     wrapper.unmount();
   });
 
@@ -567,21 +620,21 @@ describe("buttons mapping page", () => {
 
     const titles = wrapper.findAll(".mapping-editor .action-section-title").map((item) => item.text());
     expect(titles.slice(0, 3)).toEqual(["基础按键", "系统与媒体", "自定义动作"]);
-    expect(titles.indexOf("自定义动作")).toBeLessThan(titles.indexOf("打开应用"));
-    expect(titles.indexOf("打开应用")).toBeLessThan(titles.indexOf("组合动作"));
+    expect(titles.indexOf("自定义动作")).toBeLessThan(titles.indexOf("打开 APP"));
+    expect(titles.indexOf("打开 APP")).toBeLessThan(titles.indexOf("组合动作"));
     expect(titles).not.toContain("设备操作");
     expect(titles.slice(-2)).toEqual(["鼠标动作", "连续执行"]);
     expect(titles).not.toContain("鼠标滚轮");
     expect(titles).not.toContain("鼠标点击");
     expect(titles).not.toContain("鼠标移动");
 
-    // 主分组顺序：自定义动作 → 打开应用 → 组合动作。
+    // 主分组顺序：自定义动作 → 打开 APP → 组合动作。
     const customSection = wrapper
       .findAll(".mapping-editor .action-section")
       .find((item) => item.find(".action-section-title").text() === "自定义动作")!;
     const appSection = wrapper
       .findAll(".mapping-editor .action-section")
-      .find((item) => item.find(".action-section-title").text() === "打开应用")!;
+      .find((item) => item.find(".action-section-title").text() === "打开 APP")!;
     expect(customSection.element.nextElementSibling).toBe(appSection.element);
 
     // 「连续执行」独立成组，放在鼠标动作下面。
@@ -652,7 +705,7 @@ describe("buttons mapping page", () => {
     await flushPromises();
     const appSection = wrapper
       .findAll(".mapping-editor .action-section")
-      .find((item) => item.find(".action-section-title").text() === "打开应用")!;
+      .find((item) => item.find(".action-section-title").text() === "打开 APP")!;
     const labels = appSection.findAll("button.chip").map((button) => button.text());
     expect(labels.slice(0, 10)).toEqual([
       "打开无线麦 SayAll",
@@ -1171,6 +1224,146 @@ describe("buttons mapping page", () => {
     });
   });
 
+  it("前向兼容：未知动作不会让「按住时连续执行」被自动清掉", async () => {
+    // 新版本写入的未知动作当前版本不执行，但也不能在用户改同一按键的
+    // 其它格子时把 holdRepeat 一并清掉——那会在保存时丢数据。
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      schemaVersion: 9,
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "future_action", foo: 1 },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+          holdRepeat: "single",
+        },
+      },
+    } as unknown as ButtonMappings);
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    // 编辑双击格，只改双击；单击的未知动作与 holdRepeat 必须原样保留。
+    await upCard!.findAll(".mapping-cell")[1]!.trigger("click");
+    const backspaceChip = wrapper
+      .find(".mapping-editor")
+      .findAll(".chip")
+      .find((item) => item.text() === "Backspace");
+    await backspaceChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { single?: { type?: string }; holdRepeat?: string }>;
+    };
+    expect(saved.actions.up!.single?.type).toBe("future_action");
+    expect(saved.actions.up!.holdRepeat).toBe("single");
+  });
+
+  it("前向兼容：未知动作需要二次选择才会被替换", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      schemaVersion: 9,
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "future_action", foo: 1 },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    } as unknown as ButtonMappings);
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const backspaceChip = () =>
+      wrapper
+        .find(".mapping-editor")
+        .findAll(".chip")
+        .find((item) => item.text() === "Backspace");
+    await backspaceChip()!.trigger("click");
+    expect(saveButtonMappings).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain("再次选择任意动作将替换它");
+
+    await backspaceChip()!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as ButtonMappings;
+    expect(saved.actions.up!.single).toEqual({
+      type: "shortcut",
+      chord: { keys: ["backspace"] },
+    });
+  });
+
+  it("前向兼容：未知长按动作不会让单击的 holdRepeat 被自动清掉", async () => {
+    // 更高版本可能新增长按动作。当前版本无法判断它是否与
+    // holdRepeat=single 冲突，必须保留用户已有的选择。
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      schemaVersion: 9,
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["delete"] } },
+          double: { type: "disabled" },
+          long: { type: "future_long_action" },
+          holdRepeat: "single",
+        },
+      },
+    } as unknown as ButtonMappings);
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[1]!.trigger("click");
+    const backspaceChip = wrapper
+      .find(".mapping-editor")
+      .findAll(".chip")
+      .find((item) => item.text() === "Backspace");
+    await backspaceChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { long?: { type?: string }; holdRepeat?: string }>;
+    };
+    expect(saved.actions.up!.long?.type).toBe("future_long_action");
+    expect(saved.actions.up!.holdRepeat).toBe("single");
+  });
+
+  it("前向兼容：未知长按不能掩盖无效的单击 holdRepeat", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      schemaVersion: 9,
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "disabled" },
+          double: { type: "disabled" },
+          long: { type: "future_long_action" },
+          holdRepeat: "single",
+        },
+      },
+    } as unknown as ButtonMappings);
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[1]!.trigger("click");
+    const backspaceChip = wrapper
+      .find(".mapping-editor")
+      .findAll(".chip")
+      .find((item) => item.text() === "Backspace");
+    await backspaceChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { holdRepeat?: string }>;
+    };
+    expect(saved.actions.up!.holdRepeat).toBeUndefined();
+  });
+
   it("「按住时连续执行」：所有按键单/长按页显示，组合键置灰，双击页不显示", async () => {
     vi.mocked(getButtonMappings).mockResolvedValueOnce({
       enabled: true,
@@ -1446,84 +1639,238 @@ describe("buttons mapping page", () => {
     });
   });
 
-  it("预设与自定义应用都显示聚焦方式，预设默认选中对应策略（2026-10-23）", async () => {
+  it("预设不显示聚焦摘要，自定义 APP 显示聚焦与翻页状态并可去配置", async () => {
     const wrapper = await mountPage();
     const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
     await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
     const editor = wrapper.find(".mapping-editor");
-    const selectedLabel = () =>
-      editor
-        .findAll(".focus-strategy-option")
-        .find((option) => option.attributes("aria-pressed") === "true")
-        ?.text();
-    const clickPreset = async (label: string) => {
-      const chip = editor.findAll(".chip").find((item) => item.text() === label);
-      expect(chip, `预设「${label}」`).toBeTruthy();
-      await chip!.trigger("click");
-      await flushPromises();
-    };
 
-    // 记事本等普通预设：默认自动选择输入框。
-    await clickPreset("打开记事本");
-    expect(editor.find(".focus-profile").exists()).toBe(true);
-    expect(selectedLabel()).toBe("自动选择输入框");
-
-    // Chrome / 网易云：默认选中各自的 APP 快捷键。
-    await clickPreset("打开 Chrome 浏览器");
-    expect(selectedLabel()).toBe("使用 APP 快捷键聚焦");
-    expect(editor.find(".focus-shortcut-value").text()).toContain("左 Ctrl + L");
-
-    await clickPreset("打开网易云音乐");
-    expect(selectedLabel()).toBe("使用 APP 快捷键聚焦");
-    expect(editor.find(".focus-shortcut-value").text()).toContain("左 Ctrl + F");
-
-    // 预设默认快捷键也能清除，并可用「恢复默认」找回产品默认值。
-    const clearShortcut = editor.findAll("button").find((item) => item.text() === "清除")!;
-    await clearShortcut.trigger("click");
+    // 预设应用：内置聚焦与翻页，不在按键页显示可编辑配置或摘要。
+    await editor.findAll(".chip").find((item) => item.text() === "打开记事本")!.trigger("click");
     await flushPromises();
-    expect(editor.find(".focus-shortcut-value").text()).toContain("尚未录入");
-    const resetDefault = editor.findAll("button").find((item) => item.text() === "恢复默认")!;
-    expect(resetDefault).toBeTruthy();
-    await resetDefault.trigger("click");
-    await flushPromises();
-    expect(editor.find(".focus-shortcut-value").text()).toContain("左 Ctrl + F");
+    expect(editor.find(".focus-profile-summary").exists()).toBe(false);
 
-    // 自定义应用同样显示面板，未配置时默认「只打开 APP」。
+    // 自定义 APP：展开目标 APP，添加后显示聚焦与翻页状态。
+    expect(editor.find(".custom-app-group").exists()).toBe(false);
+    await editor
+      .findAll("button")
+      .find((button) => button.text() === "打开自定义 APP")!
+      .trigger("click");
+    await flushPromises();
+    expect(editor.find(".custom-app-group .target-app-title").text()).toBe("目标 APP");
     await addScannedApp(wrapper);
-    const customChip = editor
-      .findAll(".chip")
-      .find((chip) => chip.text() === "打开 Registered Example");
-    expect(customChip).toBeDefined();
-    await customChip!.trigger("click");
-    await flushPromises();
+    expect(editor.find(".focus-profile-summary").text()).toContain("聚焦：");
+    expect(editor.find(".focus-profile-summary").text()).toContain("翻页：需学习");
+    // 可写控件不得再出现在按键页。
+    expect(editor.find(".focus-strategy-option").exists()).toBe(false);
+    expect(editor.find(".focus-shortcut-value").exists()).toBe(false);
 
-    const panel = editor.find(".focus-profile");
-    expect(panel.exists()).toBe(true);
-    expect(panel.findAll(".focus-strategy-option")).toHaveLength(5);
-    expect(panel.find(".focus-point-chip").exists()).toBe(true);
-    expect(panel.find(".focus-test-button").exists()).toBe(false);
-    const labels = panel.findAll(".chip").map((chip) => chip.text());
-    for (const label of [
-      "只打开 APP",
-      "自动选择输入框",
-      "使用 APP 快捷键聚焦",
-      "聚焦已记录的输入框",
-      "记录点击位置",
-    ]) {
-      expect(labels, `策略选项：${labels.join(" / ")}`).toContain(label);
-    }
-    expect(selectedLabel()).toBe("只打开 APP");
-    await vi.waitFor(() => {
-      const saved = vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0] as {
-        actions: Record<string, { single: { type: string; target?: string } }>;
-      };
-      if (saved?.actions.ok?.single?.target !== "shell:AppsFolder\\Example!App") {
-        throw new Error("选中自定义应用后未写入映射");
-      }
-    });
+    // 「去配置」带目标跳到 APP 适配页。
+    await editor.find(".focus-profile-summary .link-button").trigger("click");
+    expect(wrapper.emitted("navigate")?.at(-1)).toEqual([
+      { page: "apps", params: { appTarget: "shell:AppsFolder\\Example!App" } },
+    ]);
   });
 
-  it("聚焦方式沿用 chip 风格：策略选项与快捷键展示", async () => {
+  it("built-in preset with a learned click position shows the summary and a configure entry", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "open_app", target: "wechat" },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      focusProfiles: {
+        wechat: {
+          strategy: "recorded_point",
+          point: {
+            xRatio: 0.5,
+            yRatio: 0.82,
+            windowWidth: 1200,
+            windowHeight: 800,
+          },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    const summary = wrapper.find(".focus-profile-summary");
+    expect(summary.text()).toContain("记录点击位置");
+    expect(summary.find(".link-button").text()).toBe("去配置");
+    await summary.find(".link-button").trigger("click");
+    expect(wrapper.emitted("navigate")?.at(-1)).toEqual([
+      { page: "apps", params: { appTarget: "wechat" } },
+    ]);
+  });
+
+  it("AppsFolder 预设目标同步聚焦与翻页记录", async () => {
+    const target = "shell:AppsFolder\\Chrome";
+    vi.mocked(resolvePresetTarget).mockImplementation(async (value) =>
+      value === target ? "chrome" : null,
+    );
+    vi.mocked(listPresetApps).mockResolvedValueOnce([
+      {
+        id: "chrome",
+        name: "Chrome 浏览器",
+        installed: true,
+        path: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      },
+    ]);
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "open_app", target },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      applications: [{ name: "Google Chrome", path: target }],
+      focusProfiles: { chrome: { strategy: "auto_composer" } },
+      scrollRegions: {
+        chrome: {
+          controlType: "Document",
+          normalizedRect: { x: 0, y: 0.1, width: 1, height: 0.8 },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    const summary = wrapper.find(".focus-profile-summary");
+    expect(summary.text()).toContain("聚焦：自动选择输入框");
+    expect(summary.text()).toContain("翻页：已学习");
+    expect(summary.find(".link-button").text()).toBe("去配置");
+    wrapper.unmount();
+  });
+
+  it("AppsFolder 预设目标优先读取目标键下的显式记录", async () => {
+    const target = "shell:AppsFolder\\WorkBuddy.WorkBuddy";
+    vi.mocked(resolvePresetTarget).mockImplementation(async (value) =>
+      value === target ? "workbuddy" : null,
+    );
+    vi.mocked(listPresetApps).mockResolvedValueOnce([
+      {
+        id: "workbuddy",
+        name: "WorkBuddy",
+        installed: true,
+        path: "C:\\Program Files\\WorkBuddy\\WorkBuddy.exe",
+      },
+    ]);
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "open_app", target },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      applications: [{ name: "WorkBuddy", path: target }],
+      focusProfiles: {
+        [target]: {
+          strategy: "app_shortcut",
+          recorded: {
+            controlType: "Edit",
+            automationId: "",
+            className: "",
+            normalizedRect: { x: 0.3, y: 0.8, width: 0.6, height: 0.08 },
+          },
+        },
+      },
+      scrollRegions: {
+        [target]: {
+          controlType: "Window",
+          normalizedRect: { x: 0, y: 0, width: 1, height: 1 },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    const summary = wrapper.find(".focus-profile-summary");
+    expect(summary.text()).toContain("聚焦：使用 APP 快捷键聚焦");
+    expect(summary.text()).toContain("翻页：已学习");
+    expect(summary.find(".link-button").text()).toBe("去配置");
+    wrapper.unmount();
+  });
+
+  it("手动添加的预设显示预置能力，并保留去配置入口", async () => {
+    const target = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+    vi.mocked(listPresetApps).mockResolvedValueOnce([
+      { id: "chrome", name: "Chrome 浏览器", installed: true, path: target },
+    ]);
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "open_app", target },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      applications: [{ name: "Chrome", path: target }],
+      focusProfiles: {},
+    });
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const summary = wrapper.find(".focus-profile-summary");
+    expect(summary.text()).toContain("使用 APP 快捷键聚焦");
+    expect(summary.text()).toContain("翻页：预置可用");
+    expect(summary.find(".link-button").text()).toBe("去配置");
+    wrapper.unmount();
+  });
+
+  it("keeps the last focus failure visible beside the read-only summary", async () => {
+    const target = "C:\\Tools\\Example.exe";
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "open_app", target },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      applications: [{ path: target, name: "Example" }],
+      focusProfiles: { [target]: { strategy: "recorded_element" } },
+    });
+    vi.mocked(getButtonMappingSnapshot).mockResolvedValueOnce({
+      enabled: true,
+      gateActive: true,
+      listenerActive: true,
+      swallowedEdges: 0,
+      leakedDowns: 0,
+      firedGestures: 0,
+      lastFired: null,
+      lastError: null,
+      lastFocus: { focused: false, reason: "no_candidate" },
+    } as never);
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("上次聚焦失败：没有找到可用的输入框");
+  });
+
+  it("opens the requested button editor from a navigation request", async () => {
+    const wrapper = await mountPage("rc003", { button: "ok", trigger: "long" });
+    await flushPromises();
+    expect(wrapper.find(".mapping-editor").text()).toContain("确定 · 长按");
+  });
+
+  it("自定义应用的聚焦摘要显示已保存的策略", async () => {
     const target = "C:\\Tools\\Example.exe";
     vi.mocked(getButtonMappings).mockResolvedValueOnce({
       enabled: true,
@@ -1543,253 +1890,16 @@ describe("buttons mapping page", () => {
     const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
     await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
     await flushPromises();
-    const panel = wrapper.find(".focus-profile");
 
-    const options = panel.findAll(".focus-strategy-option");
-    expect(options.map((option) => option.text())).toEqual([
-      "只打开 APP",
-      "自动选择输入框",
-      "使用 APP 快捷键聚焦",
-      "聚焦已记录的输入框",
-      "记录点击位置",
-    ]);
-    const selected = options.find((option) => option.text() === "使用 APP 快捷键聚焦")!;
-    expect(selected.classes()).toContain("selected");
-    expect(selected.attributes("aria-pressed")).toBe("true");
-    expect(panel.find(".focus-shortcut-value").text()).toContain("左 Ctrl + K");
-
-    expect(panel.find(".focus-test-button").exists()).toBe(false);
-    const clear = panel.findAll("button").find((button) => button.text() === "清除")!;
-    expect(clear.attributes("disabled")).toBeUndefined();
-    await clear.trigger("click");
-    await flushPromises();
-
-    expect(panel.find(".focus-shortcut-value").text()).toContain("尚未录入");
-    const saved = vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0] as {
-      focusProfiles?: Record<string, { strategy: string; shortcut?: unknown }>;
-    };
-    expect(saved.focusProfiles?.[target]?.strategy).toBe("app_shortcut");
-    expect(saved.focusProfiles?.[target]?.shortcut).toBeUndefined();
+    expect(wrapper.find(".focus-profile-summary").text()).toContain("使用 APP 快捷键聚焦");
+    expect(wrapper.find(".focus-profile-summary .link-button").text()).toBe("去配置");
   });
 
-  it("聚焦已记录的输入框：状态与清除", async () => {
-    const target = "C:\\Tools\\Example.exe";
-    vi.mocked(getButtonMappings).mockResolvedValueOnce({
-      enabled: true,
-      actions: {
-        ok: {
-          single: { type: "open_app", target },
-          double: { type: "disabled" },
-          long: { type: "disabled" },
-        },
-      },
-      applications: [{ path: target, name: "Example" }],
-      focusProfiles: {
-        [target]: {
-          strategy: "recorded_element",
-          recorded: {
-            controlType: "Edit",
-            automationId: "chat-input",
-            className: "RichEdit",
-          },
-        },
-      },
-    });
-    const wrapper = await mountPage();
-    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
-    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
-    await flushPromises();
-    const panel = wrapper.find(".focus-profile");
 
-    const status = panel.find(".focus-record-status");
-    expect(status.text()).toBe("已记录目标输入框");
-    expect(status.classes()).toContain("is-done");
-    expect(panel.findAll("button").some((button) => button.text() === "测试输入框")).toBe(false);
-    expect(panel.find(".focus-test-button").exists()).toBe(false);
-    expect(panel.findAll("button").some((button) => button.text() === "清除")).toBe(true);
-  });
 
-  it("只显示与当前策略相关的聚焦失败：记录点击位置下隐藏旧的聚焦服务结果", async () => {
-    const snapshotWithFailure = {
-      enabled: true,
-      gateActive: true,
-      listenerActive: true,
-      swallowedEdges: 0,
-      leakedDowns: 0,
-      firedGestures: 0,
-      lastFired: null,
-      lastError: null,
-      lastFocus: {
-        requestId: 1,
-        kind: "launch_then_focus",
-        focused: false,
-        reason: "timeout",
-        attempts: 1,
-        elapsedMs: 3000,
-      },
-    };
-    const target = "C:\\Tools\\Example.exe";
-    const mappingsFor = (strategy: "recorded_element" | "recorded_point") => ({
-      enabled: true,
-      actions: {
-        ok: {
-          single: { type: "open_app" as const, target },
-          double: { type: "disabled" as const },
-          long: { type: "disabled" as const },
-        },
-      },
-      focusProfiles: {
-        [target]:
-          strategy === "recorded_element"
-            ? {
-                strategy,
-                recorded: {
-                  controlType: "Edit",
-                  automationId: "chat-input",
-                  className: "RichEdit",
-                },
-              }
-            : {
-                strategy,
-                point: { xRatio: 0.5, yRatio: 0.8, windowWidth: 1000, windowHeight: 800 },
-              },
-      },
-    });
-    const openEditor = async (strategy: "recorded_element" | "recorded_point") => {
-      vi.mocked(getButtonMappings).mockResolvedValueOnce(mappingsFor(strategy));
-      vi.mocked(getButtonMappingSnapshot).mockResolvedValueOnce(snapshotWithFailure);
-      const wrapper = await mountPage();
-      const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
-      await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
-      await flushPromises();
-      return wrapper;
-    };
 
-    // 聚焦服务确实失败过：记录点击位置策略下旧结果与当前配置无关，必须隐藏。
-    const elementWrapper = await openEditor("recorded_element");
-    expect(elementWrapper.find(".focus-result-message").text()).toContain("等待超时");
 
-    const pointWrapper = await openEditor("recorded_point");
-    expect(pointWrapper.find(".focus-result-message").exists()).toBe(false);
-  });
 
-  it("配置自定义应用的聚焦方式并学习输入框（策略与字段自洽）", async () => {
-    const wrapper = await mountPage();
-    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
-    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
-    const editor = wrapper.find(".mapping-editor");
-    await addScannedApp(wrapper);
-    const target = "shell:AppsFolder\\Example!App";
-    const customChip = editor
-      .findAll(".chip")
-      .find((chip) => chip.text() === "打开 Registered Example");
-    expect(customChip).toBeDefined();
-    await customChip!.trigger("click");
-    await flushPromises();
-
-    // 选中自定义应用后出现聚焦方式面板，默认「只打开 APP」。
-    const panel = editor.find(".focus-profile");
-    expect(panel.exists()).toBe(true);
-    const recordedChip = panel
-      .findAll(".chip")
-      .find((chip) => chip.text() === "聚焦已记录的输入框");
-    await recordedChip!.trigger("click");
-    await vi.waitFor(() => {
-      const saved = vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0] as {
-        focusProfiles?: Record<string, { strategy: string }>;
-      };
-      if (saved?.focusProfiles?.[target]?.strategy !== "recorded_element") {
-        throw new Error("策略未写进聚焦档案");
-      }
-    });
-
-    // 切换策略时必须丢掉异策略字段（Rust 侧 normalized 会整条丢弃不自洽的档案）。
-    const shortcutChip = panel
-      .findAll(".chip")
-      .find((chip) => chip.text() === "使用 APP 快捷键聚焦");
-    await shortcutChip!.trigger("click");
-    await vi.waitFor(() => {
-      const saved = vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0] as {
-        focusProfiles?: Record<string, { strategy: string; recorded?: unknown }>;
-      };
-      const profile = saved?.focusProfiles?.[target];
-      if (profile?.strategy !== "app_shortcut" || profile.recorded !== undefined) {
-        throw new Error("切换策略后仍带着旧策略字段");
-      }
-    });
-
-    // 学习输入框：写入 recorded 并置为 recorded_element。
-    await recordedChip!.trigger("click");
-    await flushPromises();
-    const learnChip = panel.findAll(".chip").find((chip) => chip.text() === "开始学习输入框");
-    expect(learnChip).toBeDefined();
-    await learnChip!.trigger("click");
-    await vi.waitFor(() => {
-      if (!wrapper.text().includes("输入框学习成功")) {
-        throw new Error("学习结果提示未出现");
-      }
-    });
-    expect(activateAppForLearning).toHaveBeenCalledWith(target);
-    expect(vi.mocked(activateAppForLearning).mock.invocationCallOrder[0]).toBeLessThan(
-      vi.mocked(learnFocusTarget).mock.invocationCallOrder[0]!,
-    );
-    const learned = vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0] as {
-      focusProfiles?: Record<string, { strategy: string; recorded?: { automationId: string } }>;
-    };
-    expect(learned.focusProfiles?.[target]?.strategy).toBe("recorded_element");
-    expect(learned.focusProfiles?.[target]?.recorded?.automationId).toBe("chat-input");
-
-    // 学习失败时给可解释文案，不静默。
-    vi.mocked(learnFocusTarget).mockRejectedValueOnce(new Error("no_candidate"));
-    await learnChip!.trigger("click");
-    await vi.waitFor(() => {
-      if (!wrapper.text().includes("没有学习成功")) {
-        throw new Error("学习失败文案未出现");
-      }
-    });
-
-    // 记录点击位置（面向微信 4.x 这类没有 UIA 树的应用）：6 秒后采集鼠标位置。
-    vi.useFakeTimers();
-    await panel.findAll(".chip").find((chip) => chip.text() === "记录点击位置")!.trigger("click");
-    await flushPromises();
-    await panel.findAll(".chip").find((chip) => chip.text() === "开始记录位置")!.trigger("click");
-    await flushPromises();
-    expect(wrapper.text()).toContain("正在等待你把鼠标停在目标输入框上");
-    expect(activateAppForLearning).toHaveBeenLastCalledWith(target);
-    await vi.advanceTimersByTimeAsync(6500);
-    await flushPromises();
-    vi.useRealTimers();
-    const recordedPoint = vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0] as {
-      focusProfiles?: Record<string, { strategy: string; point?: { yRatio: number } }>;
-    };
-    expect(recordedPoint.focusProfiles?.[target]?.strategy).toBe("recorded_point");
-    expect(recordedPoint.focusProfiles?.[target]?.point?.yRatio).toBeCloseTo(0.82);
-    expect(wrapper.text()).toContain("已记录点击位置");
-  });
-
-  it("记录点击位置失败时提示中文原因（光标不在目标窗口内）", async () => {
-    vi.useFakeTimers();
-    vi.mocked(learnFocusPoint).mockRejectedValueOnce(new Error("cursor_outside_target"));
-    const wrapper = await mountPage();
-    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
-    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
-    const editor = wrapper.find(".mapping-editor");
-    await addScannedApp(wrapper);
-    await editor
-      .findAll(".chip")
-      .find((chip) => chip.text() === "打开 Registered Example")!
-      .trigger("click");
-    await flushPromises();
-    const panel = editor.find(".focus-profile");
-    await panel.findAll(".chip").find((chip) => chip.text() === "记录点击位置")!.trigger("click");
-    await flushPromises();
-    await panel.findAll(".chip").find((chip) => chip.text() === "开始记录位置")!.trigger("click");
-    await flushPromises();
-    await vi.advanceTimersByTimeAsync(6500);
-    await flushPromises();
-    vi.useRealTimers();
-    expect(wrapper.text()).toContain("鼠标不在目标应用的窗口里");
-  });
 
   it("configures mouse actions; wheel and move accept 1–100 and save on Enter or blur", async () => {
     const wrapper = await mountPage();
@@ -1962,6 +2072,30 @@ describe("buttons mapping page", () => {
     });
   });
 
+  it("warns when pre-held keys block the capture", async () => {
+    vi.mocked(startShortcutCapture).mockResolvedValueOnce(["left_control"]);
+    const wrapper = await mountPage();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const captureButton = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((button) => button.text().includes("录入自定义快捷键"))!;
+    await captureButton.trigger("click");
+    await vi.waitFor(() => expect(startShortcutCapture).toHaveBeenCalledOnce());
+    await vi.waitFor(() =>
+      expect(wrapper.text()).toContain("检测到仍有按住的按键，请先松开所有按键"),
+    );
+
+    shortcutCaptureHandler!({ key: "l", isPressed: true });
+    shortcutCaptureHandler!({ key: "l", isPressed: false });
+    await vi.waitFor(() =>
+      expect(wrapper.text()).not.toContain("检测到仍有按住的按键"),
+    );
+    wrapper.unmount();
+  });
+
   it("records Win+L safely after the user enables fallback mode", async () => {
     const wrapper = await mountPage();
     const powerCard = wrapper
@@ -1998,11 +2132,11 @@ describe("buttons mapping page", () => {
       }
     });
     await vi.waitFor(() =>
-      expect(wrapper.text()).toContain("已录入 左 Win + L，松开全部按键后完成"),
+      expect(wrapper.text()).toContain("已录入 Win + L，松开全部按键后完成"),
     );
     shortcutCaptureHandler!({ key: "l", isPressed: false });
     await vi.waitFor(() => expect(stopShortcutCapture).toHaveBeenCalledOnce());
-    await vi.waitFor(() => expect(wrapper.text()).toContain("快捷键已录入：左 Win + L"));
+    await vi.waitFor(() => expect(wrapper.text()).toContain("快捷键已录入：Win + L"));
   });
 
   it("records Ctrl+[ from the native capture edge", async () => {
@@ -2338,7 +2472,14 @@ describe("buttons mapping page", () => {
   });
 
   /** 编辑器内按标签找 chip 并返回其禁用态。 */
-  function chipState(wrapper: VueWrapper, label: string): boolean {
+  async function chipState(wrapper: VueWrapper, label: string): Promise<boolean> {
+    if (label === "添加应用" && !wrapper.find(".custom-app-group").exists()) {
+      await wrapper
+        .findAll(".mapping-editor button")
+        .find((button) => button.text() === "打开自定义 APP")!
+        .trigger("click");
+      await flushPromises();
+    }
     const chip = wrapper
       .findAll(".mapping-editor .chip")
       .find((element) => element.text().includes(label));
@@ -2360,12 +2501,12 @@ describe("buttons mapping page", () => {
   it("全开放：确定·单击所有操作可配（注入链路已真机验证）+ 单响应提示", async () => {
     const wrapper = await mountPage();
     await openCell(wrapper, "确定", 0);
-    expect(chipState(wrapper, "Enter")).toBe(false);
-    expect(chipState(wrapper, "Home")).toBe(false);
-    expect(chipState(wrapper, "空格")).toBe(false);
-    expect(chipState(wrapper, "Ctrl + V")).toBe(false);
-    expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
-    expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
+    expect(await chipState(wrapper, "Enter")).toBe(false);
+    expect(await chipState(wrapper, "Home")).toBe(false);
+    expect(await chipState(wrapper, "空格")).toBe(false);
+    expect(await chipState(wrapper, "Ctrl + V")).toBe(false);
+    expect(await chipState(wrapper, "录入自定义快捷键")).toBe(false);
+    expect(await chipState(wrapper, "添加应用")).toBe(false);
     // 武装族按键显示冷首按副作用提示（信息性，不门控）。
     expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
   });
@@ -2385,32 +2526,72 @@ describe("buttons mapping page", () => {
     expect(texts).not.toContain("截图");
     expect(chips.find((chip) => chip.text() === "Ctrl + C")!.attributes("title")).toBe("复制");
     expect(chips.find((chip) => chip.text() === "Alt + Tab")!.attributes("title")).toBe(
-      "切换窗口",
+      "切换应用：用左、右键选择，按“确定”确认，返回取消",
     );
+  });
+
+  it("选中 Win 组合后摘要与卡片显示 Win，而不是左 Win", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "电源", 0);
+    const chip = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((element) => element.text() === "Win + D");
+    expect(chip).toBeDefined();
+    await chip!.trigger("click");
+    await vi.waitFor(() => expect(saveButtonMappings).toHaveBeenCalled());
+    await flushPromises();
+
+    const editorText = wrapper.find(".mapping-editor").text();
+    expect(editorText).toContain("当前：Win + D");
+    expect(editorText).not.toContain("左 Win");
+
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    expect(powerCard.text()).toContain("Win + D");
+    expect(powerCard.text()).not.toContain("左 Win");
+  });
+
+  it("切换应用芯片写入 app_switcher 会话动作而不是一次性快捷键", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "电源", 0);
+    const chip = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((element) => element.text() === "Alt + Tab");
+    expect(chip).toBeDefined();
+    await chip!.trigger("click");
+    await vi.waitFor(() => expect(saveButtonMappings).toHaveBeenCalled());
+    const saved = vi.mocked(saveButtonMappings).mock.lastCall![0] as {
+      actions: Record<string, { single: unknown }>;
+    };
+    expect(saved.actions.power!.single).toEqual({ type: "app_switcher" });
+    const summary = wrapper.find(".mapping-editor .card-title-row p").text();
+    expect(summary).toContain("Alt + Tab");
+    expect(summary).not.toContain("切换应用");
   });
 
   it("全开放：确定·双击与 TV 所有操作可配 + 各自的单响应提示", async () => {
     const wrapper = await mountPage();
     await openCell(wrapper, "确定", 1);
-    expect(chipState(wrapper, "Enter")).toBe(false);
-    expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
-    expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
+    expect(await chipState(wrapper, "Enter")).toBe(false);
+    expect(await chipState(wrapper, "录入自定义快捷键")).toBe(false);
+    expect(await chipState(wrapper, "添加应用")).toBe(false);
     expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
 
     await openCell(wrapper, "TV", 0);
-    expect(chipState(wrapper, "Enter")).toBe(false);
-    expect(chipState(wrapper, "静音")).toBe(false);
-    expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
-    expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
+    expect(await chipState(wrapper, "Enter")).toBe(false);
+    expect(await chipState(wrapper, "静音")).toBe(false);
+    expect(await chipState(wrapper, "录入自定义快捷键")).toBe(false);
+    expect(await chipState(wrapper, "添加应用")).toBe(false);
     expect(wrapper.find(".mapping-editor").text()).toContain("这个键只执行你配置的动作");
   });
 
   it("左键与其余方向键同样开放自定义并显示结构性泄漏提示", async () => {
     const wrapper = await mountPage();
     await openCell(wrapper, "左", 0);
-    expect(chipState(wrapper, "←")).toBe(false);
-    expect(chipState(wrapper, "Backspace")).toBe(false);
-    expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
+    expect(await chipState(wrapper, "←")).toBe(false);
+    expect(await chipState(wrapper, "Backspace")).toBe(false);
+    expect(await chipState(wrapper, "录入自定义快捷键")).toBe(false);
     expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
 
     // 与型号无关：RC001 上左键同样开放。
@@ -2425,10 +2606,10 @@ describe("buttons mapping page", () => {
   it("电源（直接归因族）全开放且无单响应提示", async () => {
     const wrapper = await mountPage();
     await openCell(wrapper, "电源", 2);
-    expect(chipState(wrapper, "Esc")).toBe(false);
-    expect(chipState(wrapper, "Win + Shift + S")).toBe(false);
-    expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
-    expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
+    expect(await chipState(wrapper, "Esc")).toBe(false);
+    expect(await chipState(wrapper, "Win + Shift + S")).toBe(false);
+    expect(await chipState(wrapper, "录入自定义快捷键")).toBe(false);
+    expect(await chipState(wrapper, "添加应用")).toBe(false);
     expect(wrapper.find(".mapping-editor").text()).not.toContain("原生按键动作");
   });
 

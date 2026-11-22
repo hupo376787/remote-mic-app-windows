@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import MacrosPage from "./MacrosPage.vue";
 import { clearMacroEditorSession } from "./macro-editor-session";
+import { macrosViewSession } from "./macros-view-session";
 import type { MacroDefinition, MacroLibraryDocument } from "../lib/bridge";
+import { listPresetApps, resolvePresetTarget } from "../lib/bridge";
 
 type CaptureHandler = (edge: { key: string; isPressed: boolean; source?: string }) => void;
 let shortcutCaptureHandler: CaptureHandler | null = null;
@@ -72,6 +74,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
       shortcutCaptureHandler = handler;
       return () => {};
     }),
+    resolvePresetTarget: vi.fn(async () => null),
     listPresetApps: vi.fn(async () => [
       { id: "sayall", name: "无线麦 SayAll", installed: true },
       { id: "wechat", name: "微信", installed: true },
@@ -105,6 +108,8 @@ beforeEach(() => {
   shortcutCaptureHandler = null;
   // 编辑会话是模块级的（跨页面切换保留进度）；用例之间必须清空，否则上一条的草稿会在下一条挂载时恢复。
   clearMacroEditorSession();
+  // 库首帧快照同样是模块级的；不重置会让后续用例从上一轮的列表开始。
+  macrosViewSession.definitions = null;
   getCombinedActionsSpy.mockReset().mockResolvedValue(structuredClone(initialLibrary));
   saveMacroSpy.mockReset().mockImplementation(async (definition: MacroDefinition) => ({
     formatVersion: 1,
@@ -120,6 +125,7 @@ beforeEach(() => {
   testMacroStepSpy.mockReset().mockResolvedValue("test.00000000000000000000000000000002");
   testMacroSpy.mockReset().mockResolvedValue(undefined);
   getMacroRunStatusSpy.mockReset().mockResolvedValue({ running: false, report: null });
+  vi.mocked(resolvePresetTarget).mockResolvedValue(null);
   activateAppForLearningSpy.mockReset().mockResolvedValue(undefined);
   learnFocusTargetSpy.mockReset().mockResolvedValue({
     controlType: "Edit",
@@ -165,9 +171,63 @@ describe("组合动作页 · 库浏览", () => {
     expect(wrapper.text()).toContain("聚焦学习过的输入框");
   });
 
-  it("空库显示空态与创建引导（对齐 Mac 文案）", async () => {
+  it("数量显示在主标题右侧，不再显示「我的组合动作」小节标题", async () => {
+    const wrapper = await mountPage();
+    const heading = wrapper.find(".page-header .macros-heading-row");
+    expect(heading.find("h1").text()).toBe("组合动作");
+    expect(heading.find(".count-badge").text()).toBe("1");
+    expect(wrapper.text()).not.toContain("我的组合动作");
+    expect(wrapper.find(".library-pane .search-input").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("搜索清除按钮有独立的大点击区，点击后恢复完整列表", async () => {
+    const wrapper = await mountPage();
+    await wrapper.find(".search-input").setValue("786");
+    const clear = wrapper.find(".search-clear");
+    expect(clear.exists()).toBe(true);
+    expect(clear.attributes("aria-label")).toBe("清除搜索");
+    expect((clear.element as HTMLButtonElement).type).toBe("button");
+    await clear.trigger("click");
+    expect((wrapper.find(".search-input").element as HTMLInputElement).value).toBe("");
+    expect(wrapper.find(".search-clear").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("状态提示显示 8 秒后自动关闭", async () => {
+    const wrapper = await mountPage();
+    vi.useFakeTimers();
+    await findButton(wrapper, "导出").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".macros-inline-status").text()).toContain("组合动作已导出");
+
+    vi.advanceTimersByTime(7_999);
+    await flushPromises();
+    expect(wrapper.find(".macros-inline-status").exists()).toBe(true);
+
+    vi.advanceTimersByTime(1);
+    await flushPromises();
+    expect(wrapper.find(".macros-inline-status").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("切页重建时首帧直接渲染上次的库（不闪 0）", async () => {
+    const first = await mountPage();
+    expect(first.findAll(".macro-item")).toHaveLength(1);
+    first.unmount();
+
+    // 第二次挂载：库读取故意挂起，验证首帧用的是模块级快照而不是空列表。
+    getCombinedActionsSpy.mockReset().mockImplementation(() => new Promise(() => undefined));
+    const wrapper = mount(MacrosPage, { props: { runtime: null } });
+    expect(wrapper.find(".count-badge").text()).toBe("1");
+    expect(wrapper.findAll(".macro-item")[0]?.text()).toContain("打开记事本并聚焦");
+    wrapper.unmount();
+  });
+
+  it("空库显示空态与创建引导（对齐 Mac 文案），且不显示数量徽标", async () => {
     getCombinedActionsSpy.mockResolvedValue({ formatVersion: 1, definitions: [] });
     const wrapper = await mountPage();
+    expect(wrapper.find(".page-header .count-badge").exists()).toBe(false);
     expect(wrapper.text()).toContain("创建第一个组合动作");
     expect(wrapper.text()).toContain("把打开 App、按键或输入框聚焦组合起来，再设到遥控器按键上。");
   });
@@ -560,6 +620,42 @@ describe("组合动作页 · 编辑向导", () => {
     expect(display).not.toMatch(/return/i);
   });
 
+  it("系统与媒体预设只显示按键组合，功能描述退为悬停提示", async () => {
+    const wrapper = await mountPage();
+    await findButton(wrapper, "编辑").trigger("click");
+    await flushPromises();
+    await findButton(wrapper, "编排步骤").trigger("click");
+    await flushPromises();
+    const shortcutCard = wrapper
+      .findAll(".action-card")
+      .find((item) => item.text().includes("单键或快捷键"))!;
+    await shortcutCard.trigger("click");
+    await flushPromises();
+
+    const chips = wrapper.findAll(".preset-grid .chip");
+    const texts = chips.map((chip) => chip.text());
+    expect(texts).toContain("Alt + Tab");
+    expect(texts).toContain("Win + D");
+    expect(texts).toContain("Ctrl + W");
+    expect(texts).not.toContain("切换应用");
+    expect(texts).not.toContain("显示桌面");
+    expect(texts).not.toContain("关闭窗口");
+
+    const chip = (text: string) => chips.find((item) => item.text() === text)!;
+    expect(chip("Alt + Tab").attributes("title")).toBe(
+      "切换应用：用左、右键选择，按“确定”确认，返回取消",
+    );
+    expect(chip("Win + D").attributes("title")).toBe("显示桌面");
+
+    await chip("Alt + Tab").trigger("click");
+    await flushPromises();
+    expect(wrapper.get('[data-testid="chord-display"]').text()).toContain("Alt + Tab");
+
+    await chip("Win + D").trigger("click");
+    await flushPromises();
+    expect(wrapper.get('[data-testid="chord-display"]').text()).toContain("Win + D");
+  });
+
   it("离开组合动作页时停止仍在进行的录入", async () => {
     const wrapper = await mountPage();
     await findButton(wrapper, "编辑").trigger("click");
@@ -603,57 +699,35 @@ describe("组合动作页 · 编辑向导", () => {
     expect(wrapper.find(".step-card-body select").exists()).toBe(false);
   });
 
-  it("聚焦步骤与按键页共用完整应用列表与默认聚焦方式", async () => {
-    const wrapper = await mountPage();
-    await findButton(wrapper, "编辑").trigger("click");
-    await flushPromises();
-    await findButton(wrapper, "编排步骤").trigger("click");
-    await flushPromises();
-    const focusItem = wrapper
-      .findAll(".step-edit-item")
-      .find((item) => item.text().includes("聚焦学习过的输入框"))!;
-    await focusItem.trigger("click");
-    await flushPromises();
-
-    const body = wrapper.find(".step-card-body");
-    const methodChips = body.findAll(".focus-strategy-option");
-    expect(methodChips).toHaveLength(5);
-    expect(methodChips.find((chip) => chip.classes().includes("selected"))?.text()).toBe(
-      "自动选择输入框",
-    );
-    expect(body.find(".focus-profile").exists()).toBe(true);
-    expect(body.text()).not.toContain("开始学习输入框");
-    expect(body.text()).not.toContain("测试输入框");
-    expect(body.findAll(".app-library .chip")).toHaveLength(12);
-    expect(body.findAll(".chip").map((chip) => chip.text())).toContain("打开记事本");
-  });
-
-  it("聚焦步骤显示按键页保存的 APP 快捷键", async () => {
+  it("聚焦步骤按按键页样式分组：预设、打开自定义 APP、目标 APP 与摘要", async () => {
+    const target = "C:\\Apps\\Cursor.exe";
     getButtonMappingsSpy.mockResolvedValue({
       enabled: true,
       actions: {
-        home: {
-          single: { type: "open_app", target: "chrome" },
+        ok: {
+          single: { type: "open_app", target },
           double: { type: "disabled" },
           long: { type: "disabled" },
         },
       },
+      applications: [
+        { name: "Cursor", path: target },
+        { name: "Chrome 浏览器", path: "chrome" },
+      ],
       focusProfiles: {
-        chrome: {
-          strategy: "app_shortcut",
-          shortcut: { keys: ["left_control", "l"] },
+        [target]: {
+          strategy: "recorded_element",
+          recorded: { controlType: "Edit", automationId: "editor", className: "RichEdit" },
         },
       },
+      scrollRegions: { [target]: { controlType: "Document", automationId: "RootWebArea" } },
     });
     getCombinedActionsSpy.mockResolvedValue({
       formatVersion: 1,
       definitions: [
         {
           ...baseDefinition,
-          steps: [
-            { stepId: "step.01", action: "open_application", parameters: { target: "chrome" } },
-            { stepId: "step.02", action: "focus_input", parameters: { target: "chrome" } },
-          ],
+          steps: [{ stepId: "step.01", action: "focus_input", parameters: { target } }],
         },
       ],
     });
@@ -669,31 +743,61 @@ describe("组合动作页 · 编辑向导", () => {
     await flushPromises();
 
     const body = wrapper.find(".step-card-body");
-    expect(body.find(".focus-strategy-option.selected").text()).toBe("使用 APP 快捷键聚焦");
-    expect(body.find(".focus-shortcut-value").text()).toContain("左 Ctrl + L");
-    expect(body.findAll(".chip").map((chip) => chip.text())).toContain("打开 Chrome 浏览器");
+    expect(body.find(".action-section-title").text()).toBe("打开 APP");
+    const presetChips = body.findAll(".app-library .chip").map((chip) => chip.text());
+    expect(presetChips).toContain("打开记事本");
+    expect(presetChips).toContain("打开自定义 APP");
+    expect(body.find(".custom-app-group .target-app-title").text()).toBe("目标 APP");
+    expect(body.find(".custom-app-group").text()).toContain("打开 Cursor");
+    expect(body.find(".focus-profile-summary").text()).toContain("打开后自动聚焦");
+    expect(body.find(".focus-profile-summary").text()).toContain("翻页：已学习");
+    expect(body.find(".focus-strategy-option").exists()).toBe(false);
 
-    // 组合动作页改选聚焦方式会写回按键页共用档案，而不是另存一份。
-    const autoChip = body
-      .findAll(".focus-strategy-option")
-      .find((chip) => chip.text() === "自动选择输入框")!;
-    await autoChip.trigger("click");
+    await body.find(".focus-profile-summary .link-button").trigger("click");
+    expect(wrapper.emitted("navigate")?.at(-1)).toEqual([
+      { page: "apps", params: { appTarget: target } },
+    ]);
+
+    // 目标 APP 组内选中预设目标时，组保持展开（2026-11-14 用户反馈）。
+    const chromeChip = body
+      .find(".custom-app-group")
+      .findAll(".chip")
+      .find((chip) => chip.text().includes("Chrome 浏览器"))!;
+    await chromeChip.trigger("click");
     await flushPromises();
-    expect(saveButtonMappingsSpy).toHaveBeenCalled();
-    const saved = saveButtonMappingsSpy.mock.calls.at(-1)![0] as {
-      focusProfiles: Record<string, { strategy: string }>;
-    };
-    expect(saved.focusProfiles.chrome?.strategy).toBe("auto_composer");
-    expect(body.find(".focus-strategy-option.selected").text()).toBe("自动选择输入框");
+    expect(body.find(".custom-app-group").exists()).toBe(true);
   });
 
-  it("组合动作页可以录入聚焦快捷键并写回共用档案", async () => {
+  it("预置微信显示已记录的点击位置并可去配置", async () => {
     getButtonMappingsSpy.mockResolvedValue({
       enabled: true,
-      actions: {},
-      focusProfiles: {
-        notepad: { strategy: "app_shortcut", shortcut: { keys: ["left_control", "l"] } },
+      actions: {
+        ok: {
+          single: { type: "open_app", target: "wechat" },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
       },
+      focusProfiles: {
+        wechat: {
+          strategy: "recorded_point",
+          point: {
+            xRatio: 0.5,
+            yRatio: 0.82,
+            windowWidth: 1200,
+            windowHeight: 800,
+          },
+        },
+      },
+    });
+    getCombinedActionsSpy.mockResolvedValue({
+      formatVersion: 1,
+      definitions: [
+        {
+          ...baseDefinition,
+          steps: [{ stepId: "step.01", action: "focus_input", parameters: { target: "wechat" } }],
+        },
+      ],
     });
     const wrapper = await mountPage();
     await findButton(wrapper, "编辑").trigger("click");
@@ -706,31 +810,116 @@ describe("组合动作页 · 编辑向导", () => {
       .trigger("click");
     await flushPromises();
 
-    await findButton(wrapper, "点击录入快捷键").trigger("click");
-    await flushPromises();
-    expect(startShortcutCaptureSpy).toHaveBeenCalled();
-
-    shortcutCaptureHandler?.({ key: "left_control", isPressed: true });
-    shortcutCaptureHandler?.({ key: "left_alt", isPressed: true });
-    shortcutCaptureHandler?.({ key: "n", isPressed: true });
-    shortcutCaptureHandler?.({ key: "n", isPressed: false });
-    shortcutCaptureHandler?.({ key: "left_alt", isPressed: false });
-    shortcutCaptureHandler?.({ key: "left_control", isPressed: false });
-    await flushPromises();
-
-    const saved = saveButtonMappingsSpy.mock.calls.at(-1)![0] as {
-      focusProfiles: Record<string, { strategy: string; shortcut?: { keys: string[] } }>;
-    };
-    expect(saved.focusProfiles.notepad?.strategy).toBe("app_shortcut");
-    expect(saved.focusProfiles.notepad?.shortcut?.keys).toEqual([
-      "left_control",
-      "left_alt",
-      "n",
+    const summary = wrapper.find(".focus-profile-summary");
+    expect(summary.text()).toContain("记录点击位置");
+    await summary.find(".link-button").trigger("click");
+    expect(wrapper.emitted("navigate")?.at(-1)).toEqual([
+      { page: "apps", params: { appTarget: "wechat" } },
     ]);
-    expect(wrapper.find(".focus-shortcut-value").text()).toContain("左 Ctrl + 左 Alt + N");
   });
 
-  it("按键页没有打开应用动作时，组合动作仍列出完整应用列表", async () => {
+  it("手动添加的预设使用预置能力并保留去配置入口", async () => {
+    const target = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+    vi.mocked(listPresetApps).mockResolvedValueOnce([
+      { id: "chrome", name: "Chrome 浏览器", installed: true, path: target },
+    ]);
+    getButtonMappingsSpy.mockResolvedValue({
+      enabled: true,
+      actions: {
+        home: {
+          single: { type: "open_app", target },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      applications: [{ name: "Chrome 浏览器", path: target }],
+      focusProfiles: {},
+    });
+    getCombinedActionsSpy.mockResolvedValue({
+      formatVersion: 1,
+      definitions: [
+        {
+          ...baseDefinition,
+          steps: [{ stepId: "step.01", action: "focus_input", parameters: { target } }],
+        },
+      ],
+    });
+    const wrapper = await mountPage();
+    await findButton(wrapper, "编辑").trigger("click");
+    await flushPromises();
+    await findButton(wrapper, "编排步骤").trigger("click");
+    await flushPromises();
+    await wrapper
+      .findAll(".step-edit-item")
+      .find((item) => item.text().includes("聚焦学习过的输入框"))!
+      .trigger("click");
+    await flushPromises();
+
+    const summary = wrapper.find(".focus-profile-summary");
+    expect(summary.text()).toContain("使用 APP 快捷键聚焦");
+    expect(summary.text()).toContain("翻页：预置可用");
+    expect(summary.find(".link-button").text()).toBe("去配置");
+    expect(wrapper.find(".focus-strategy-option").exists()).toBe(false);
+  });
+
+  it("AppsFolder 预设目标同步聚焦与翻页记录", async () => {
+    const target = "shell:AppsFolder\\Chrome";
+    vi.mocked(resolvePresetTarget).mockImplementation(async (value) =>
+      value === target ? "chrome" : null,
+    );
+    vi.mocked(listPresetApps).mockResolvedValueOnce([
+      {
+        id: "chrome",
+        name: "Chrome 浏览器",
+        installed: true,
+        path: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      },
+    ]);
+    getButtonMappingsSpy.mockResolvedValue({
+      enabled: true,
+      actions: {
+        home: {
+          single: { type: "open_app", target },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      applications: [{ name: "Google Chrome", path: target }],
+      focusProfiles: { chrome: { strategy: "auto_composer" } },
+      scrollRegions: {
+        chrome: {
+          controlType: "Document",
+          normalizedRect: { x: 0, y: 0.1, width: 1, height: 0.8 },
+        },
+      },
+    });
+    getCombinedActionsSpy.mockResolvedValue({
+      formatVersion: 1,
+      definitions: [
+        {
+          ...baseDefinition,
+          steps: [{ stepId: "step.01", action: "focus_input", parameters: { target } }],
+        },
+      ],
+    });
+    const wrapper = await mountPage();
+    await findButton(wrapper, "编辑").trigger("click");
+    await flushPromises();
+    await findButton(wrapper, "编排步骤").trigger("click");
+    await flushPromises();
+    await wrapper
+      .findAll(".step-edit-item")
+      .find((item) => item.text().includes("聚焦学习过的输入框"))!
+      .trigger("click");
+    await flushPromises();
+
+    const summary = wrapper.find(".focus-profile-summary");
+    expect(summary.text()).toContain("聚焦：自动选择输入框");
+    expect(summary.text()).toContain("翻页：已学习");
+    expect(summary.find(".link-button").text()).toBe("去配置");
+  });
+
+  it("按键页没有打开应用动作时，聚焦步骤仍列出预设并展开空目标组", async () => {
     getButtonMappingsSpy.mockResolvedValue({ enabled: true, actions: {} });
     const wrapper = await mountPage();
     await findButton(wrapper, "编辑").trigger("click");
@@ -745,29 +934,89 @@ describe("组合动作页 · 编辑向导", () => {
 
     const body = wrapper.find(".step-card-body");
     const appChips = body.findAll(".app-library .chip").map((chip) => chip.text());
-    expect(appChips).toHaveLength(12);
     expect(appChips).toContain("打开微信");
     expect(appChips).toContain("打开 QQ");
+    expect(appChips).toContain("打开自定义 APP");
+    expect(appChips).not.toContain("添加应用");
     expect(body.text()).not.toContain("按键页还没有「打开应用」动作");
-    expect(body.find(".focus-strategy-option.selected").text()).toBe("自动选择输入框");
+    const summary = body.find(".focus-profile-summary");
+    expect(summary.exists()).toBe(true);
+    expect(summary.text()).toContain("自动选择输入框");
+
+    await body
+      .findAll("button")
+      .find((button) => button.text() === "打开自定义 APP")!
+      .trigger("click");
+    await flushPromises();
+    expect(body.find(".custom-app-group .target-app-title").text()).toBe("目标 APP");
+    expect(body.find(".custom-app-group").text()).toContain("添加应用");
   });
 
-  it("聚焦步骤显示按键页已记录的输入框方式", async () => {
+  it("聚焦步骤只要求选择目标 App，未配置聚焦方式也能继续", async () => {
+    const target = "C:\\Apps\\Plain.exe";
+    getButtonMappingsSpy.mockResolvedValue({
+      enabled: true,
+      actions: {},
+      applications: [{ name: "Plain", path: target }],
+      focusProfiles: {},
+    });
+    getCombinedActionsSpy.mockResolvedValue({
+      formatVersion: 1,
+      definitions: [
+        {
+          ...baseDefinition,
+          steps: [{ stepId: "step.01", action: "focus_input", parameters: { target } }],
+        },
+      ],
+    });
+    const wrapper = await mountPage();
+    await findButton(wrapper, "编辑").trigger("click");
+    await flushPromises();
+    await findButton(wrapper, "编排步骤").trigger("click");
+    await flushPromises();
+    await wrapper
+      .findAll(".step-edit-item")
+      .find((item) => item.text().includes("聚焦学习过的输入框"))!
+      .trigger("click");
+    await flushPromises();
+
+    const body = wrapper.find(".step-card-body");
+    expect(body.find(".focus-profile-summary").text()).toContain("只打开 APP");
+    expect(wrapper.text()).not.toContain("还没设置完");
+    const next = findButton(wrapper, "下一步");
+    expect(next.attributes("disabled")).toBeUndefined();
+    await next.trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("测试与保存");
+  });
+
+  it("聚焦步骤显示自定义 App 已记录的输入框方式", async () => {
+    const target = "C:\\Apps\\Custom.exe";
     getButtonMappingsSpy.mockResolvedValue({
       enabled: true,
       actions: {
         ok: {
-          single: { type: "open_app", target: "notepad" },
+          single: { type: "open_app", target },
           double: { type: "disabled" },
           long: { type: "disabled" },
         },
       },
+      applications: [{ name: "Custom", path: target }],
       focusProfiles: {
-        notepad: {
+        [target]: {
           strategy: "recorded_element",
           recorded: { controlType: "Edit", automationId: "editor", className: "RichEdit" },
         },
       },
+    });
+    getCombinedActionsSpy.mockResolvedValue({
+      formatVersion: 1,
+      definitions: [
+        {
+          ...baseDefinition,
+          steps: [{ stepId: "step.01", action: "focus_input", parameters: { target } }],
+        },
+      ],
     });
     const wrapper = await mountPage();
     await findButton(wrapper, "编辑").trigger("click");
@@ -780,82 +1029,8 @@ describe("组合动作页 · 编辑向导", () => {
       .trigger("click");
     await flushPromises();
     const body = wrapper.find(".step-card-body");
-    expect(body.find(".focus-strategy-option.selected").text()).toBe("聚焦已记录的输入框");
-    expect(body.find(".focus-record-status").text()).toContain("已记录目标输入框");
-    expect(body.text()).not.toContain("重新学习");
-    expect(body.text()).toContain("开始学习输入框");
-  });
-
-  it("组合动作页可以学习输入框并写回共用档案", async () => {
-    getButtonMappingsSpy.mockResolvedValue({
-      enabled: true,
-      actions: {},
-      focusProfiles: {
-        notepad: {
-          strategy: "recorded_element",
-          recorded: { controlType: "Edit", automationId: "editor", className: "RichEdit" },
-        },
-      },
-    });
-    const wrapper = await mountPage();
-    await findButton(wrapper, "编辑").trigger("click");
-    await flushPromises();
-    await findButton(wrapper, "编排步骤").trigger("click");
-    await flushPromises();
-    await wrapper
-      .findAll(".step-edit-item")
-      .find((item) => item.text().includes("聚焦学习过的输入框"))!
-      .trigger("click");
-    await flushPromises();
-
-    await findButton(wrapper, "开始学习输入框").trigger("click");
-    await flushPromises();
-    expect(activateAppForLearningSpy).toHaveBeenCalledWith("notepad");
-    expect(learnFocusTargetSpy).toHaveBeenCalled();
-    expect(wrapper.text()).toContain("输入框学习成功");
-
-    const saved = saveButtonMappingsSpy.mock.calls.at(-1)![0] as {
-      focusProfiles: Record<string, { strategy: string; recorded?: unknown }>;
-    };
-    expect(saved.focusProfiles.notepad?.strategy).toBe("recorded_element");
-    expect(saved.focusProfiles.notepad?.recorded).toBeTruthy();
-  });
-
-  it("组合动作页可以记录点击位置并写回共用档案", async () => {
-    vi.useFakeTimers();
-    getButtonMappingsSpy.mockResolvedValue({
-      enabled: true,
-      actions: {},
-      focusProfiles: {
-        notepad: {
-          strategy: "recorded_point",
-          point: { xRatio: 0.5, yRatio: 0.6, windowWidth: 800, windowHeight: 600 },
-        },
-      },
-    });
-    const wrapper = await mountPage();
-    await findButton(wrapper, "编辑").trigger("click");
-    await flushPromises();
-    await findButton(wrapper, "编排步骤").trigger("click");
-    await flushPromises();
-    await wrapper
-      .findAll(".step-edit-item")
-      .find((item) => item.text().includes("聚焦学习过的输入框"))!
-      .trigger("click");
-    await flushPromises();
-
-    await findButton(wrapper, "开始记录位置").trigger("click");
-    await flushPromises();
-    expect(activateAppForLearningSpy).toHaveBeenCalledWith("notepad");
-    await vi.advanceTimersByTimeAsync(6_000);
-    await flushPromises();
-    vi.useRealTimers();
-
-    const saved = saveButtonMappingsSpy.mock.calls.at(-1)![0] as {
-      focusProfiles: Record<string, { strategy: string; point?: { yRatio: number } }>;
-    };
-    expect(saved.focusProfiles.notepad?.strategy).toBe("recorded_point");
-    expect(saved.focusProfiles.notepad?.point?.yRatio).toBeCloseTo(0.82);
+    expect(body.find(".focus-profile-summary").text()).toContain("打开后自动聚焦");
+    expect(body.find(".focus-strategy-option").exists()).toBe(false);
   });
 
   it("保存失败显示错误状态且不关闭编辑器", async () => {
@@ -939,16 +1114,16 @@ describe("组合动作页 · 编辑向导", () => {
     expect(wrapper.find(".step-card-body .chip.selected").text()).toBe("打开记事本并聚焦");
   });
 
-  it("「扫描本机应用」在组合动作页打开本机应用弹窗", async () => {
+  it("「添加应用」在组合动作页打开应用选择弹窗", async () => {
     const wrapper = await mountPage();
     await findButton(wrapper, "编辑").trigger("click");
     await flushPromises();
     await findButton(wrapper, "编排步骤").trigger("click");
     await flushPromises();
-    const scan = wrapper.findAll("button").find((item) => item.text() === "扫描本机应用")!;
-    await scan.trigger("click");
+    const add = wrapper.findAll("button").find((item) => item.text() === "添加应用")!;
+    await add.trigger("click");
     await flushPromises();
-    expect(wrapper.text()).toContain("本机应用");
+    expect(wrapper.text()).toContain("选择应用");
   });
 
   it("单键或快捷键列出已保存与常用的快捷键，点选即写入", async () => {
@@ -968,21 +1143,26 @@ describe("组合动作页 · 编辑向导", () => {
     await flushPromises();
     expect(wrapper.text()).toContain("已保存的快捷键");
     expect(wrapper.text()).toContain("记事本 · Ctrl + K");
-    const copy = wrapper.findAll(".chip").find((chip) => chip.text() === "复制")!;
+    const copy = wrapper.findAll(".chip").find((chip) => chip.text() === "Ctrl + C")!;
+    expect(copy.attributes("title")).toBe("复制");
     await copy.trigger("click");
     await flushPromises();
     expect(wrapper.get('[data-testid="chord-display"]').text()).toContain("Ctrl + C");
   });
 
-  it("「添加应用」写入共享自定义应用列表并选中", async () => {
+  it("「添加应用」的文件兜底写入共享自定义应用列表并选中", async () => {
     pickCustomAppSpy.mockResolvedValue({ name: "自定义App", path: "C:\\Apps\\Custom.exe" });
     const wrapper = await mountPage();
     await findButton(wrapper, "编辑").trigger("click");
     await flushPromises();
     await findButton(wrapper, "编排步骤").trigger("click");
     await flushPromises();
-    const add = wrapper.findAll("button").find((item) => item.text().includes("添加应用"))!;
+    const add = wrapper.findAll("button").find((item) => item.text() === "添加应用")!;
     await add.trigger("click");
+    await flushPromises();
+    await wrapper.get(".registered-apps-dialog .picker-program-pick").trigger("click");
+    await flushPromises();
+    await wrapper.get(".registered-apps-dialog .primary-button").trigger("click");
     await flushPromises();
     const saved = saveButtonMappingsSpy.mock.calls.at(-1)?.[0] as {
       applications?: Array<{ name: string; path: string }>;

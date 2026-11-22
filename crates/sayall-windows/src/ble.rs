@@ -56,6 +56,14 @@ const CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(10);
 /// 自愈逻辑也没有机会执行。所有连接关键路径的 WinRT 异步调用都必须有界。
 const DEVICE_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 const GATT_ASYNC_TIMEOUT: Duration = Duration::from_secs(5);
+/// 服务/特征发现的上限。Windows 对不可达 BLE 设备的 GATT 连接尝试要等
+/// **约 7.7 秒**才由系统自己放弃（2026-09-22 实测 7689/7697/7698 ms，见
+/// `docs/plan/2026-09-22-atvv-connection-fix-priority.md` P0-3）。5 秒超时
+/// 会在系统放弃前 `Cancel`，把未完成的系统队列项留给紧接着的重连；
+/// 2026-11-01 用户日志里每次重连都先耗 5 秒再失败，随后快速
+/// `gatt_unreachable`。10 秒覆盖系统自身的失败窗口，同时仍能兜住
+/// 2026-10-21 那种永不返回的调用。
+const GATT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 /// 提前重连的安静窗下限（2026-10-13，issue #206 第三轮报障人真机实测）：
@@ -2001,6 +2009,37 @@ fn ble_error_code(error: &PlatformError) -> &'static str {
     }
 }
 
+/// `ConnectionStatus` 的稳定日志 token（issue #104，2026-11-19）。
+///
+/// `gatt_status=1` 只说明对端不可达；要区分"Windows 自己认为链路还在，但 GATT
+/// 服务发现失败"与"链路根本不在"，必须在失败瞬间记录系统侧的链路状态。
+/// 读不到状态时写 `unknown`，不猜测。
+fn link_status_token(status: Option<BluetoothConnectionStatus>) -> &'static str {
+    match status {
+        Some(BluetoothConnectionStatus::Connected) => "connected",
+        Some(BluetoothConnectionStatus::Disconnected) => "disconnected",
+        _ => "unknown",
+    }
+}
+
+/// 连接阶段失败时的链路状态日志行。
+///
+/// 只含阶段、世代、尝试次数、链路状态与稳定错误码；不写设备地址、设备 ID、
+/// 设备名称或原始错误文本（LOGGING.md 隐私红线）。
+fn connect_link_state_note(
+    stage: &'static str,
+    connection_generation: u64,
+    attempt: u32,
+    status: Option<BluetoothConnectionStatus>,
+    error: &PlatformError,
+) -> String {
+    format!(
+        "ble_connect_link phase=failure stage={stage} connection_generation={connection_generation} attempt={attempt} link_status={} error_domain=bluetooth error_code={}",
+        link_status_token(status),
+        ble_error_code(error)
+    )
+}
+
 fn connect_stage<T>(
     reconnecting: bool,
     attempt: u32,
@@ -2539,6 +2578,9 @@ fn handle_control(
             let Some(capabilities) = pipeline.capabilities() else {
                 return;
             };
+            // 语音键开始：应用切换器（Alt+Tab）会话必须释放 Alt，否则按住说话
+            // 快捷键会带着按住的 Alt 进入输入法（对齐 Mac：语音开始取消切换器）。
+            crate::button_mapping::note_voice_session_started();
             // 个人中心统计：以 MIC_OPEN 请求作为语音键按下的可观测时刻。不能用
             // HID F5 代替——普通键盘 F5 也会被误计。
             usage.begin_voice_session(crate::foreground::foreground_application_name());
@@ -2566,6 +2608,8 @@ fn handle_control(
             session_id,
             generation,
         } => {
+            // 报告层语音路径可能不经过 MIC_OPEN：这里再发一次取消（幂等）。
+            crate::button_mapping::note_voice_session_started();
             // RC003 的报告层语音路径实测直接发 0x04 STREAM_START，不经过
             // MIC_OPEN；这里兜底开始统计。若 MIC_OPEN 已先记过，方法幂等。
             usage.ensure_voice_session_started(crate::foreground::foreground_application_name());
@@ -2718,9 +2762,14 @@ fn handle_control(
                         tool,
                         crate::ime::ImeSwitchScope::VoicePress,
                     ) {
-                        Ok(crate::ime::ImeActivation::Switched) => {
+                        Ok(
+                            crate::ime::ImeActivation::Switched
+                            | crate::ime::ImeActivation::SwitchedUnverified,
+                        ) => {
                             // 竞态标注（2026-10-03）：合成已先于切换发出，本按赶不上
                             // ——按设计为下一次按下生效；换工具来源已由"选中即对齐"覆盖。
+                            // SwitchedUnverified 也按“切过”处理：读回不可靠，不能据此
+                            // 判定没切；后续读回探针会给实际状态。
                             gatt_note(format!(
                                 "voice_hold action=switch_after_chord session={session_id} note=本按的合成早于切换完成，按下一次生效"
                             ));
@@ -3604,11 +3653,12 @@ impl BleSession {
                 .map(|name| name.to_string())
         })?;
         let inferred_model = remote_model_from_name(&name);
-        let model = if inferred_model == RemoteModel::Unknown {
-            read_remote_model(pending.device()).unwrap_or(RemoteModel::Unknown)
-        } else {
-            inferred_model
-        };
+        // 型号只用于界面显示：**不在 `service_discovery` 之前做 GATT 查询**。
+        // 2026-11-01 用户日志：断链状态下 Namespace 0x180A 的查询每次都要等满
+        // 5 秒超时，取消后紧接着发现 ATVV 服务，导致每次重连先白耗 5 秒，
+        // 更容易错过遥控器刚醒来的短窗口。型号改为 ATVV 会话完整建立后再
+        // best-effort 读取（见本函数末尾）。
+        let model = inferred_model;
         {
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Discovering;
@@ -3620,12 +3670,22 @@ impl BleSession {
             snapshot.remote_token = Some(crate::device_token(device_id));
             snapshot.last_error = None;
         }
-        pending.service = Some(connect_stage(
-            reconnecting,
-            reconnect_attempt,
-            "service_discovery",
-            || find_service(pending.device(), SERVICE_UUID),
-        )?);
+        let service_result =
+            connect_stage(reconnecting, reconnect_attempt, "service_discovery", || {
+                find_service(pending.device(), SERVICE_UUID)
+            });
+        if let Err(error) = &service_result {
+            // issue #104（2026-11-19）：失败瞬间记录 Windows 自己认为的链路状态。
+            // 这一步必须发生在 `?` 释放 `PendingBleConnection` 之前。
+            gatt_note(connect_link_state_note(
+                "service_discovery",
+                connection_generation,
+                reconnect_attempt,
+                pending.device().ConnectionStatus().ok(),
+                error,
+            ));
+        }
+        pending.service = Some(service_result?);
         pending.transmit = Some(connect_stage(
             reconnecting,
             reconnect_attempt,
@@ -3722,6 +3782,28 @@ impl BleSession {
                 battery_sender,
                 connection_generation,
             );
+        }
+        // 型号只在 ATVV 会话完整建立后读取（2026-11-01）：它是纯展示信息，
+        // 不能挡住语音主路径。断链时跳过；连接成功时用缓存查询，失败保持
+        // Unknown，不影响语音与后续重连。日志只记录型号枚举，不含设备身份。
+        let link_status = connected.device.ConnectionStatus().ok();
+        if should_read_model_number(connected.model, link_status) {
+            match read_remote_model(&connected.device) {
+                Some(model) => {
+                    connected.model = model;
+                    lock(state).remote_model = model;
+                    gatt_note(format!(
+                        "ble_model phase=completed terminal_result=passed source=gatt_2a24 model={model:?} connection_generation={connection_generation}"
+                    ));
+                }
+                None => gatt_note(format!(
+                    "ble_model phase=completed terminal_result=unavailable source=gatt_2a24 retryable=false connection_generation={connection_generation}"
+                )),
+            }
+        } else if connected.model == RemoteModel::Unknown {
+            gatt_note(format!(
+                "ble_model phase=skipped reason=link_not_connected status={link_status:?} retryable=false connection_generation={connection_generation}"
+            ));
         }
         Ok(connected)
     }
@@ -3858,6 +3940,14 @@ impl BleSession {
             self.cleanup_started = true;
             self.battery_monitor.take();
             let mut best_effort_failures = 0u32;
+            let link_status = self.device.ConnectionStatus().ok();
+            let link_connected = should_disable_notifications(link_status);
+            if !link_connected {
+                gatt_note(format!(
+                    "ble_session_cleanup phase=notify_disable_skipped reason=link_disconnected status={link_status:?} connection_generation={}",
+                    self.connection_generation
+                ));
+            }
             if let Some(token) = self.battery_token.take() {
                 if let Some(characteristic) = &self.battery_characteristic {
                     if characteristic.RemoveValueChanged(token).is_err() {
@@ -3865,9 +3955,11 @@ impl BleSession {
                     }
                 }
             }
-            if let Some(characteristic) = &self.battery_characteristic {
-                if disable_notifications(characteristic).is_err() {
-                    best_effort_failures += 1;
+            if link_connected {
+                if let Some(characteristic) = &self.battery_characteristic {
+                    if disable_notifications(characteristic).is_err() {
+                        best_effort_failures += 1;
+                    }
                 }
             }
             if let Some(service) = self.battery_service.take() {
@@ -3892,14 +3984,17 @@ impl BleSession {
             if self.close_params_monitor(false) {
                 best_effort_failures += 1;
             }
-            // The remote CCCD can no longer be written after a physical
-            // disconnect. Handler removal and object Close are the ownership
-            // boundary; notification disable is best-effort in that state.
-            if disable_notifications(&self.audio).is_err() {
-                best_effort_failures += 1;
-            }
-            if disable_notifications(&self.control).is_err() {
-                best_effort_failures += 1;
+            // 物理断开后 CCCD 写不进去（2026-11-01 用户日志：这一步让清理
+            // 多等两个 5 秒超时，并把未完成的写入留给系统队列）。Handler
+            // 退订与对象 Close 才是所有权边界；只在链路仍 Connected 时写
+            // CCCD 关闭通知。
+            if link_connected {
+                if disable_notifications(&self.audio).is_err() {
+                    best_effort_failures += 1;
+                }
+                if disable_notifications(&self.control).is_err() {
+                    best_effort_failures += 1;
+                }
             }
             if let Some(request) = self.params_request.take() {
                 match request.Close() {
@@ -4031,20 +4126,27 @@ static DIAGNOSTIC_LOG_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
 static DIAGNOSTIC_LOG_METADATA: OnceLock<DiagnosticLogMetadata> = OnceLock::new();
 
 /// 在任何功能组件启动前配置生产诊断日志。环境变量仍可覆盖路径，方便受控取证；
+/// 但落在产品根目录 `%LOCALAPPDATA%\SayAll`（而非其下的 `Logs`）的覆盖会归一到
+/// `Logs\<原文件名>`，避免历史测试变量把日志和「打开日志目录」带到上一层。
 /// 正式应用由宿主传入 LocalAppData 下的固定路径，日志内容绝不打印该路径。
 pub fn initialize_diagnostic_log(
     default_path: std::path::PathBuf,
     metadata: DiagnosticLogMetadata,
 ) -> bool {
-    let path = std::env::var_os("SAYALL_GATT_LOG")
-        .map(std::path::PathBuf::from)
-        .unwrap_or(default_path);
+    let override_path = std::env::var_os("SAYALL_GATT_LOG").map(std::path::PathBuf::from);
+    let path = crate::diagnostic_log::resolve_log_path(default_path, override_path.clone());
     let parent_ready = path
         .parent()
         .map(|parent| std::fs::create_dir_all(parent).is_ok())
         .unwrap_or(false);
-    let _ = DIAGNOSTIC_LOG_PATH.set(path);
+    let _ = DIAGNOSTIC_LOG_PATH.set(path.clone());
     let _ = DIAGNOSTIC_LOG_METADATA.set(metadata);
+    if override_path
+        .as_ref()
+        .is_some_and(|original| original != &path)
+    {
+        gatt_note("diagnostic_log path_normalized reason=override_outside_logs".to_owned());
+    }
     parent_ready
         && diagnostic_log_path()
             .map(|path| crate::diagnostic_log::probe(&path))
@@ -4545,7 +4647,7 @@ fn find_service(
     let operation = device
         .GetGattServicesForUuidWithCacheModeAsync(uuid, BluetoothCacheMode::Uncached)
         .map_err(windows_error)?;
-    let result = wait_async(operation, GATT_ASYNC_TIMEOUT, "gatt_find_atvv_service")?;
+    let result = wait_async(operation, GATT_DISCOVERY_TIMEOUT, "gatt_find_atvv_service")?;
     require_success(result.Status().map_err(windows_error)?, "发现 ATVV 服务")?;
     let services = result.Services().map_err(windows_error)?;
     if services.Size().map_err(windows_error)? != 1 {
@@ -4625,7 +4727,7 @@ fn find_characteristic(
         .map_err(windows_error)?;
     let result = wait_async(
         operation,
-        GATT_ASYNC_TIMEOUT,
+        GATT_DISCOVERY_TIMEOUT,
         "gatt_find_atvv_characteristic",
     )?;
     require_success(result.Status().map_err(windows_error)?, "发现 ATVV 特征")?;
@@ -4634,6 +4736,27 @@ fn find_characteristic(
         return Err(PlatformError::VoiceCharacteristicMissing(label));
     }
     characteristics.GetAt(0).map_err(windows_error)
+}
+
+/// 是否需要读取 2A24 型号（纯判定，便于单测）。
+///
+/// 型号只用于界面展示；只有名称无法区分型号**且链路已经 Connected** 时才值得
+/// 发起 GATT 查询。断链时查询会等到超时，2026-11-01 用户日志里正是它把每次
+/// 重连额外拖长 5 秒。
+fn should_read_model_number(
+    inferred: RemoteModel,
+    link_status: Option<BluetoothConnectionStatus>,
+) -> bool {
+    inferred == RemoteModel::Unknown && link_status == Some(BluetoothConnectionStatus::Connected)
+}
+
+/// 断链后是否还值得写 CCCD 关闭通知（纯判定）。
+///
+/// 物理断开后 CCCD 写不进去；继续尝试只会让清理多等两个 5 秒超时，并把
+/// 未完成的写入留给系统队列。只在链路仍 Connected 时写，其余情况直接
+/// 退订本地事件并 Close。
+fn should_disable_notifications(link_status: Option<BluetoothConnectionStatus>) -> bool {
+    link_status == Some(BluetoothConnectionStatus::Connected)
 }
 
 fn read_remote_model(device: &BluetoothLEDevice) -> Option<RemoteModel> {
@@ -4888,6 +5011,41 @@ mod tests {
     }
 
     #[test]
+    fn model_number_is_only_read_after_the_link_is_connected() {
+        // 2026-11-01 用户日志：断链时 0x180A 查询每次等满 5 秒，随后取消并
+        // 立刻做 ATVV 发现。型号是纯展示信息，只允许在 Connected 后读。
+        assert!(should_read_model_number(
+            RemoteModel::Unknown,
+            Some(BluetoothConnectionStatus::Connected)
+        ));
+        assert!(!should_read_model_number(
+            RemoteModel::Unknown,
+            Some(BluetoothConnectionStatus::Disconnected)
+        ));
+        assert!(!should_read_model_number(RemoteModel::Unknown, None));
+        assert!(!should_read_model_number(
+            RemoteModel::Rc001,
+            Some(BluetoothConnectionStatus::Connected)
+        ));
+        assert!(!should_read_model_number(
+            RemoteModel::Rc003,
+            Some(BluetoothConnectionStatus::Connected)
+        ));
+    }
+
+    #[test]
+    fn cccd_disable_is_skipped_once_the_link_is_down() {
+        // 物理断开后写 CCCD 只会等到 5 秒超时；本地退订与 Close 仍是必需步骤。
+        assert!(should_disable_notifications(Some(
+            BluetoothConnectionStatus::Connected
+        )));
+        assert!(!should_disable_notifications(Some(
+            BluetoothConnectionStatus::Disconnected
+        )));
+        assert!(!should_disable_notifications(None));
+    }
+
+    #[test]
     fn wetype_activation_is_limited_to_the_wetype_default_hotkey() {
         let chord = |keys| KeyChord { keys };
 
@@ -5033,6 +5191,38 @@ mod tests {
             !text.contains("gatt_"),
             "raw_error 不应含内部错误码：{text}"
         );
+    }
+
+    #[test]
+    fn connect_failure_records_the_windows_link_state() {
+        // issue #104（2026-11-19）：`gatt_status=1` 只能说明对端不可达，无法区分
+        // "Windows 自己认为链路还在" 与 "链路根本不在"。失败瞬间的
+        // `ConnectionStatus` 必须落盘，且不得包含设备身份或错误原文。
+        let error = gatt_status_error(GattCommunicationStatus(1), "发现 ATVV 服务");
+        let note = connect_link_state_note(
+            "service_discovery",
+            67,
+            5,
+            Some(BluetoothConnectionStatus::Disconnected),
+            &error,
+        );
+        assert!(note.contains("phase=failure"), "{note}");
+        assert!(note.contains("stage=service_discovery"), "{note}");
+        assert!(note.contains("connection_generation=67"), "{note}");
+        assert!(note.contains("attempt=5"), "{note}");
+        assert!(note.contains("link_status=disconnected"), "{note}");
+        assert!(note.contains("error_code=gatt_unreachable"), "{note}");
+        assert!(!note.contains("发现 ATVV 服务"), "不得落 raw_error：{note}");
+
+        assert_eq!(
+            link_status_token(Some(BluetoothConnectionStatus::Connected)),
+            "connected"
+        );
+        assert_eq!(
+            link_status_token(Some(BluetoothConnectionStatus::Disconnected)),
+            "disconnected"
+        );
+        assert_eq!(link_status_token(None), "unknown");
     }
 
     #[test]

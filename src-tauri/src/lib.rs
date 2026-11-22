@@ -21,6 +21,7 @@ use std::sync::{Arc, RwLock};
 use tauri::{Emitter, Manager};
 
 mod accent;
+mod agent_access;
 mod app_icon;
 mod button_profiles;
 mod common_phrase_panel;
@@ -56,6 +57,44 @@ use usage::{build_usage_profile, UsageProfile, UsageStore, UsageSync};
 
 /// 主窗口标签（`tauri.conf.json` 里由配置创建的唯一窗口）。
 const MAIN_WINDOW_LABEL: &str = "main";
+
+/// 主窗口最小尺寸（逻辑像素），与 `tauri.conf.json` 的
+/// `width` / `height` / `minWidth` / `minHeight` 保持一致。
+const MAIN_WINDOW_MIN_WIDTH: f64 = 1066.67;
+const MAIN_WINDOW_MIN_HEIGHT: f64 = 800.0;
+const MAIN_WINDOW_DEFAULT_HEIGHT: f64 = 800.0;
+
+/// 内容区最小尺寸换算到物理像素。`WM_GETMINMAXINFO` / `WM_WINDOWPOSCHANGING`
+/// 使用窗口外框尺寸，调用方再补上非客户区边框。
+fn min_window_inner_size(scale_factor: f64) -> (i32, i32) {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    (
+        (MAIN_WINDOW_MIN_WIDTH * scale).round() as i32,
+        (MAIN_WINDOW_MIN_HEIGHT * scale).round() as i32,
+    )
+}
+
+#[cfg(test)]
+mod main_window_size_tests {
+    use super::*;
+
+    #[test]
+    fn converts_minimum_to_physical_pixels() {
+        assert_eq!(min_window_inner_size(1.0), (1067, 800));
+        assert_eq!(min_window_inner_size(2.0), (2133, 1600));
+        assert_eq!(min_window_inner_size(1.5), (1600, 1200));
+    }
+
+    #[test]
+    fn invalid_scale_falls_back_to_one_x() {
+        assert_eq!(min_window_inner_size(0.0), (1067, 800));
+        assert_eq!(min_window_inner_size(f64::NAN), (1067, 800));
+    }
+}
 
 /// 取主窗口（tao `Window`）。
 ///
@@ -388,6 +427,138 @@ unsafe extern "system" fn window_key_subclass(
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
+/// 主窗口最小尺寸的子类化实例 ID。
+#[cfg(windows)]
+const WINDOW_MIN_SIZE_SUBCLASS_ID: usize = 0x5A13;
+
+/// 在原生窗口消息层限制主窗口最小尺寸。
+///
+/// 仅在 Tauri `Resized` 回调里调用 `set_size` 会在拖动过程中反复改尺寸，
+/// 底部会闪。这里在窗口真正改变位置/大小之前修改 `WINDOWPOS`，并补齐
+/// `WM_GETMINMAXINFO`，拖动时窗口不会先缩小再弹回。
+#[cfg(windows)]
+fn install_window_min_size_subclass(window: &tauri::Window) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::SetWindowSubclass;
+
+    let Ok(raw) = window.hwnd() else {
+        sayall_windows::gatt_note(
+            "window_resize action=install_min_size_subclass terminal_result=failed reason=hwnd_missing"
+                .to_owned(),
+        );
+        return;
+    };
+    let installed = unsafe {
+        SetWindowSubclass(
+            HWND(raw.0),
+            Some(window_min_size_subclass),
+            WINDOW_MIN_SIZE_SUBCLASS_ID,
+            0,
+        )
+        .as_bool()
+    };
+    sayall_windows::gatt_note(format!(
+        "window_resize action=install_min_size_subclass terminal_result={}",
+        if installed { "passed" } else { "failed" }
+    ));
+}
+
+/// 主窗口最小外框尺寸（物理像素）。
+///
+/// `tauri.conf.json` 的 `minHeight` 是内容区高度；Windows 的
+/// `WINDOWPOS` / `MINMAXINFO` 使用窗口外框，所以要补上非客户区边框。
+#[cfg(windows)]
+fn min_window_outer_size(hwnd: windows::Win32::Foundation::HWND) -> (i32, i32) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let scale = if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 };
+    let (minimum_width, minimum_height) = min_window_inner_size(scale);
+
+    let mut window_rect = RECT::default();
+    let mut client_rect = RECT::default();
+    let window_ok = unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_ok();
+    let client_ok = unsafe { GetClientRect(hwnd, &mut client_rect) }.is_ok();
+    let frame_width = if window_ok && client_ok {
+        ((window_rect.right - window_rect.left) - (client_rect.right - client_rect.left)).max(0)
+    } else {
+        0
+    };
+    let frame_height = if window_ok && client_ok {
+        ((window_rect.bottom - window_rect.top) - (client_rect.bottom - client_rect.top)).max(0)
+    } else {
+        0
+    };
+
+    (minimum_width + frame_width, minimum_height + frame_height)
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn window_min_size_subclass(
+    hwnd: windows::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    _id: usize,
+    _ref_data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MINMAXINFO, SWP_NOSIZE, WINDOWPOS, WM_ENDSESSION, WM_GETMINMAXINFO, WM_NCDESTROY,
+        WM_QUERYENDSESSION, WM_WINDOWPOSCHANGING,
+    };
+
+    if message == WM_NCDESTROY {
+        let _ = RemoveWindowSubclass(
+            hwnd,
+            Some(window_min_size_subclass),
+            WINDOW_MIN_SIZE_SUBCLASS_ID,
+        );
+        return DefSubclassProc(hwnd, message, wparam, lparam);
+    }
+
+    // 比 SM_SHUTTINGDOWN 更早的关机信号：helper 常驻对账在关机开始时可能
+    // 仍会醒来，先置标志让 run_schtasks() 拒绝拉起 schtasks.exe。
+    // 必须继续走 DefSubclassProc：不改变窗口对系统关机询问的应答。
+    if message == WM_QUERYENDSESSION {
+        crate::rc003_task::note_query_end_session();
+        sayall_windows::gatt_note(
+            "app_exit session_end phase=observed reason=query_end_session".to_owned(),
+        );
+    } else if message == WM_ENDSESSION {
+        if wparam.0 == 0 {
+            // 关机被其他应用取消：清除标志，恢复常驻对账。
+            crate::rc003_task::clear_query_end_session();
+            sayall_windows::gatt_note(
+                "app_exit session_end phase=cancelled reason=end_session_cancelled".to_owned(),
+            );
+        } else {
+            sayall_windows::gatt_note(
+                "app_exit session_end phase=confirmed reason=end_session".to_owned(),
+            );
+        }
+    }
+
+    if message == WM_GETMINMAXINFO && lparam.0 != 0 {
+        let (minimum_width, minimum_height) = min_window_outer_size(hwnd);
+        let info = &mut *(lparam.0 as *mut MINMAXINFO);
+        info.ptMinTrackSize.x = minimum_width;
+        info.ptMinTrackSize.y = minimum_height;
+    } else if message == WM_WINDOWPOSCHANGING && lparam.0 != 0 {
+        let (minimum_width, minimum_height) = min_window_outer_size(hwnd);
+        let position = &mut *(lparam.0 as *mut WINDOWPOS);
+        if position.flags.0 & SWP_NOSIZE.0 == 0 && position.cx > 0 && position.cy > 0 {
+            position.cx = position.cx.max(minimum_width);
+            position.cy = position.cy.max(minimum_height);
+        }
+    }
+
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
 /// 界面未能正常显示时写进窗口标题的文案（2026-10-07 定稿，见 docs/product-copy.md）。
 /// 放在 Rust 是因为界面已经不工作时它也必须能显示，与托盘菜单文案同理。
 #[cfg(windows)]
@@ -600,6 +771,8 @@ struct AppState {
     update_completed_version: std::sync::Mutex<Option<String>>,
     /// 回眸本地归档（`%LOCALAPPDATA%\SayAll\transcripts\v1`）。
     transcripts: Arc<transcripts::TranscriptStore>,
+    /// 回眸「本地 Agent 访问」的授权状态（`%LOCALAPPDATA%\SayAll\mcp\v1`）。
+    agent_access: Arc<agent_access::AgentAccessStore>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -1069,7 +1242,7 @@ fn windows_settings_section_name(section: WindowsSettingsSection) -> &'static st
     }
 }
 
-/// 打开固定的 Windows 设置页（向导第②步「打开蓝牙设置」等入口）。
+/// 打开固定的 Windows 设置页（向导第①/②步的「打开蓝牙设置」等入口）。
 #[tauri::command]
 fn open_windows_settings(section: WindowsSettingsSection) -> Result<(), String> {
     let name = windows_settings_section_name(section);
@@ -1128,12 +1301,21 @@ mod windows_settings_tests {
 /// 日志只落结果、可见性与耗时，不含窗口标题或任何用户信息。
 #[tauri::command]
 fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    hide_main_window_with_source(app, "ctrl_w")
+}
+
+/// 自定义标题栏关闭按钮：与 Ctrl+W 同一隐藏动作，仅日志来源不同。
+#[tauri::command]
+fn hide_main_window_from_title_bar(app: tauri::AppHandle) -> Result<(), String> {
+    hide_main_window_with_source(app, "titlebar")
+}
+
+fn hide_main_window_with_source(app: tauri::AppHandle, source: &str) -> Result<(), String> {
     let started = std::time::Instant::now();
     let Some(window) = main_window(&app) else {
-        sayall_windows::gatt_note(
-            "window_close action=hide_to_tray source=ctrl_w phase=completed terminal_result=failed error_domain=window error_code=not_found retryable=true reason=main_window_missing"
-                .to_owned(),
-        );
+        sayall_windows::gatt_note(format!(
+            "window_close action=hide_to_tray source={source} phase=completed terminal_result=failed error_domain=window error_code=not_found retryable=true reason=main_window_missing"
+        ));
         return Err("主窗口不存在".to_owned());
     };
     // `hide()` 的返回值只说明"消息已投递"，不代表窗口真的隐藏了（见
@@ -1143,7 +1325,7 @@ fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
     let result = window.hide().map_err(|error| error.to_string());
     let visible_after = window.is_visible().unwrap_or(true);
     sayall_windows::gatt_note(format!(
-        "window_close action=hide_to_tray source=ctrl_w phase=completed terminal_result={} visible_before={visible_before} visible_after={visible_after} elapsed_ms={}",
+        "window_close action=hide_to_tray source={source} phase=completed terminal_result={} visible_before={visible_before} visible_after={visible_after} elapsed_ms={}",
         if result.is_ok() { "passed" } else { "failed" },
         started.elapsed().as_millis()
     ));
@@ -1169,15 +1351,49 @@ fn set_app_icon(
     Ok(applied)
 }
 
+/// 扫描失败只记稳定错误分类，不写 Windows 错误原文（可能含设备/系统细节）。
+fn scan_error_code(error: &sayall_windows::PlatformError) -> &'static str {
+    match error {
+        sayall_windows::PlatformError::UnsupportedPlatform => "unsupported_platform",
+        sayall_windows::PlatformError::WindowsApi(_) => "windows_api",
+        sayall_windows::PlatformError::WorkerUnavailable => "worker_unavailable",
+        sayall_windows::PlatformError::OperationTimedOut => "operation_timed_out",
+        _ => "platform",
+    }
+}
+
 #[tauri::command]
 async fn scan_paired_remotes(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<PairedRemote>, String> {
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note("ble_scan phase=requested".to_owned());
     let platform = Arc::clone(&state.platform);
-    tauri::async_runtime::spawn_blocking(move || platform.scan_paired_remotes())
-        .await
-        .map_err(|error| format!("扫描任务失败：{error}"))?
-        .map_err(|error| error.to_string())
+    match tauri::async_runtime::spawn_blocking(move || platform.scan_paired_remotes()).await {
+        Ok(Ok(remotes)) => {
+            sayall_windows::gatt_note(format!(
+                "ble_scan phase=completed terminal_result=passed found_count={} elapsed_ms={}",
+                remotes.len(),
+                started.elapsed().as_millis()
+            ));
+            Ok(remotes)
+        }
+        Ok(Err(error)) => {
+            sayall_windows::gatt_note(format!(
+                "ble_scan phase=completed terminal_result=failed error_domain=platform error_code={} retryable=true elapsed_ms={}",
+                scan_error_code(&error),
+                started.elapsed().as_millis()
+            ));
+            Err(error.to_string())
+        }
+        Err(error) => {
+            sayall_windows::gatt_note(format!(
+                "ble_scan phase=completed terminal_result=failed error_domain=task error_code=join_failed retryable=true elapsed_ms={}",
+                started.elapsed().as_millis()
+            ));
+            Err(format!("扫描任务失败：{error}"))
+        }
+    }
 }
 
 #[tauri::command]
@@ -2841,7 +3057,9 @@ async fn reset_button_mappings(
     let platform = Arc::clone(&state.platform);
     let result =
         match tauri::async_runtime::spawn_blocking(move || -> Result<ButtonMappings, String> {
-            let saved = settings.save_button_mappings(ButtonMappings::default())?;
+            // 恢复默认是用户显式覆盖：允许替换读不出的现有文件，
+            // 但存储层会先留时间戳备份（2026-11-11 升级丢配置反馈）。
+            let saved = settings.replace_button_mappings(ButtonMappings::default())?;
             platform.set_button_mappings(saved.clone());
             Ok(saved)
         })
@@ -3287,10 +3505,13 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
     let mut open_app_count = 0_usize;
     let mut focus_input_count = 0_usize;
     let mut common_phrases_count = 0_usize;
+    let mut app_switcher_count = 0_usize;
     let mut scroll_count = 0_usize;
+    let mut page_scroll_count = 0_usize;
     let mut mouse_count = 0_usize;
     let mut macro_count = 0_usize;
     let mut disabled_count = 0_usize;
+    let mut unsupported_count = 0_usize;
     for actions in mappings.actions.values() {
         for action in [&actions.single, &actions.double, &actions.long] {
             match action {
@@ -3298,18 +3519,25 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
                 ButtonAction::OpenApp { .. } => open_app_count += 1,
                 ButtonAction::FocusInput => focus_input_count += 1,
                 ButtonAction::OpenCommonPhrases => common_phrases_count += 1,
+                ButtonAction::AppSwitcher => app_switcher_count += 1,
                 ButtonAction::Scroll { .. } => scroll_count += 1,
+                ButtonAction::PageUp
+                | ButtonAction::PageDown
+                | ButtonAction::ScrollToTop
+                | ButtonAction::ScrollToBottom => page_scroll_count += 1,
                 ButtonAction::MouseClick { .. } | ButtonAction::MouseMove { .. } => {
                     mouse_count += 1
                 }
                 ButtonAction::RunMacro { .. } => macro_count += 1,
                 ButtonAction::Disabled => disabled_count += 1,
+                ButtonAction::Unsupported(_) => unsupported_count += 1,
             }
         }
     }
     format!(
-        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} focus_input_count={focus_input_count} common_phrases_count={common_phrases_count} scroll_count={scroll_count} mouse_count={mouse_count} macro_count={macro_count} disabled_cell_count={disabled_count}",
+        "enabled={} schema_version={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} focus_input_count={focus_input_count} common_phrases_count={common_phrases_count} app_switcher_count={app_switcher_count} scroll_count={scroll_count} page_scroll_count={page_scroll_count} mouse_count={mouse_count} macro_count={macro_count} disabled_cell_count={disabled_count} unsupported_count={unsupported_count}",
         mappings.enabled,
+        mappings.schema_version,
         mappings.actions.len()
     )
 }
@@ -3375,6 +3603,20 @@ async fn test_button_mapping(
         ButtonAction::OpenCommonPhrases => {
             Err("「打开常用语」不在试一下范围内：请绑定按键后到目标应用里使用".to_owned())
         }
+        ButtonAction::AppSwitcher => Err(
+            "「切换应用」需要真实按下绑定的遥控器按键：打开切换器后用方向键选择、按“确定”确认、返回取消"
+                .to_owned(),
+        ),
+        ButtonAction::Unsupported(_) => {
+            Err("这个动作来自更新版本，当前版本不支持；请升级无线麦后重试".to_owned())
+        }
+        ButtonAction::PageUp
+        | ButtonAction::PageDown
+        | ButtonAction::ScrollToTop
+        | ButtonAction::ScrollToBottom => Err(
+            "翻页测试请在 APP 适配页点击“测试向上翻页/测试向下翻页”；试一下无法确定目标 APP"
+                .to_owned(),
+        ),
     }
 }
 
@@ -3383,6 +3625,36 @@ fn list_preset_apps(
     state: tauri::State<'_, AppState>,
 ) -> Vec<sayall_windows::app_launcher::PresetAppInfo> {
     state.platform.preset_apps()
+}
+
+/// 应用库目标是否对应内置预设；前端用它把 AppsFolder 目标归到预设能力。
+#[tauri::command]
+fn resolve_preset_target(target: String) -> Option<String> {
+    sayall_windows::app_launcher::preset_id_for_target(&target).map(str::to_owned)
+}
+
+/// 从可执行文件或快捷方式提取真实应用图标（PNG data URL）。失败返回 None，由前端显示通用图标。
+#[tauri::command]
+fn get_application_icon(path: String) -> Option<String> {
+    let shell = path.to_ascii_lowercase().starts_with("shell:appsfolder");
+    let png = if shell {
+        sayall_windows::transcript_capture_windows::icon_png_for_shell_item(&path).or_else(|| {
+            sayall_windows::registered_apps::resolve_registered_executable_path(&path).and_then(
+                |executable| {
+                    sayall_windows::transcript_capture_windows::icon_png_for_executable(&executable)
+                },
+            )
+        })
+    } else {
+        // 程序选择可以是 `.lnk`：`PrivateExtractIconsW` 对快捷方式常拿不到图标，
+        // 再向 Shell 要一次（与开始菜单/资源管理器同源），失败才回退首字母。
+        sayall_windows::transcript_capture_windows::icon_png_for_executable(&path)
+            .or_else(|| sayall_windows::transcript_capture_windows::icon_png_for_shell_item(&path))
+    }?;
+    Some(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png)
+    ))
 }
 
 /// 「学习输入框」第一步：先打开/激活目标应用，不改变它的输入焦点。
@@ -3446,6 +3718,37 @@ async fn test_app_focus(target: String, state: tauri::State<'_, AppState>) -> Re
         .map_err(|error| error.to_string())
 }
 
+/// 「学习滚动区域」：阻塞至多 3 秒等待用户点击目标窗口的可滚动内容区。
+#[tauri::command]
+async fn learn_scroll_region(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::scroll_region::ScrollRegionTarget, String> {
+    let platform = Arc::clone(&state.platform);
+    let result = tauri::async_runtime::spawn_blocking(move || platform.learn_scroll_region())
+        .await
+        .map_err(|error| format!("学习滚动区域任务失败：{error}"))?;
+    refocus_main_window_soon(app);
+    result.map_err(|error| error.to_string())
+}
+
+/// 「测试滚动」：打开/激活目标应用后执行一次翻页并读回结果。
+#[tauri::command]
+async fn test_scroll_region(
+    app: tauri::AppHandle,
+    target: String,
+    command: sayall_windows::scroll_region::ScrollCommand,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::scroll_region::ScrollOutcome, String> {
+    let platform = Arc::clone(&state.platform);
+    let result =
+        tauri::async_runtime::spawn_blocking(move || platform.test_scroll_region(target, command))
+            .await
+            .map_err(|error| format!("测试滚动任务失败：{error}"))?;
+    refocus_main_window_soon(app);
+    result.map_err(|error| error.to_string())
+}
+
 /// 原生文件选择器：选择自定义应用（.exe/.lnk）。用户取消返回 null。
 #[tauri::command]
 fn pick_custom_app() -> Option<sayall_windows::app_launcher::CustomAppPick> {
@@ -3491,9 +3794,34 @@ fn capture_mic_baseline_slot() -> &'static std::sync::Mutex<Option<u64>> {
     CAPTURE_MIC_BASELINE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// 录入会话代数：start 递增，stop/watchdog 也递增。只有持有当前代次的
+/// watchdog 才能收尾，防止旧的 30 秒计时器把新会话停掉。
+static SHORTCUT_CAPTURE_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// 后端兜底：前端 15 秒超时已经会 stop；30 秒是 WebView 崩溃 / IPC 丢失时的
+/// 最后一道释放，避免报告层目标与全局吞键永久停留在录入态。
+const SHORTCUT_CAPTURE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn claim_shortcut_capture_finish(expected: Option<u64>) -> bool {
+    match expected {
+        Some(expected) => SHORTCUT_CAPTURE_GENERATION
+            .compare_exchange(
+                expected,
+                expected.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok(),
+        None => {
+            SHORTCUT_CAPTURE_GENERATION.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+}
+
 #[tauri::command]
 fn start_shortcut_capture(
     app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
 ) -> Result<Vec<sayall_windows::send_input::KeyCode>, String> {
     let started = std::time::Instant::now();
     let mic_baseline = sayall_windows::capture_mic_baseline();
@@ -3501,6 +3829,15 @@ fn start_shortcut_capture(
         Ok(mut guard) => *guard = mic_baseline,
         Err(poisoned) => *poisoned.into_inner() = mic_baseline,
     }
+    // 录入期间暂停报告层清键（2026-11-15）：增强捕获可能把同一 WUDFHost 里
+    // 笔记本键盘的 Enter / 方向 / Home / 音量等目标 usage 当成遥控器按键清掉，
+    // 导致低级键盘钩子完全收不到。录入是前台短会话，遥控器此时不参与；先让
+    // 报告层停止清键，stop 时按当前开关与映射恢复。fail-open：失败不影响录入。
+    state.platform.set_shortcut_capture_suspension(true);
+    sayall_windows::gatt_note(
+        "shortcut_capture action=suspend_enhanced_capture phase=requested terminal_result=pending suspended=true"
+            .to_owned(),
+    );
     sayall_windows::gatt_note(format!(
         "shortcut_capture action=start phase=requested suppression=global_paired_edges capture_mode=main_key_only ime_yield=pending mic_baseline={mic_baseline:?}",
     ));
@@ -3521,6 +3858,11 @@ fn start_shortcut_capture(
         {
             sayall_windows::gatt_note(note);
         }
+        state.platform.set_shortcut_capture_suspension(false);
+        sayall_windows::gatt_note(
+            "shortcut_capture action=suspend_enhanced_capture phase=rollback suspended=false reason=gate_unavailable"
+                .to_owned(),
+        );
         sayall_windows::gatt_note(format!(
             "shortcut_capture action=start phase=completed terminal_result=failed error_domain=keyboard_hook error_code=gate_unavailable reason=hook_not_active retryable=true elapsed_ms={}",
             started.elapsed().as_millis()
@@ -3535,6 +3877,22 @@ fn start_shortcut_capture(
         started.elapsed().as_millis(),
         sayall_windows::key_gate::capture_diagnostics_summary()
     ));
+    // 后端兜底：前端 15 秒超时会 stop；这里防 WebView 崩溃 / IPC 丢失后
+    // 报告层目标与全局吞键永久停留在录入态。代次不匹配的旧计时器直接退出。
+    let generation = SHORTCUT_CAPTURE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let watchdog_app = app.clone();
+    let watchdog = std::thread::Builder::new()
+        .name("sayall-shortcut-capture-watchdog".to_owned())
+        .spawn(move || {
+            std::thread::sleep(SHORTCUT_CAPTURE_WATCHDOG);
+            let _ = finish_shortcut_capture(&watchdog_app, "watchdog", Some(generation));
+        });
+    if watchdog.is_err() {
+        sayall_windows::gatt_note(
+            "shortcut_capture action=watchdog phase=completed terminal_result=failed reason=spawn_failed"
+                .to_owned(),
+        );
+    }
     Ok(preheld)
 }
 
@@ -3549,21 +3907,51 @@ struct ShortcutCaptureStopResult {
 
 #[tauri::command]
 fn stop_shortcut_capture(app: tauri::AppHandle) -> ShortcutCaptureStopResult {
+    finish_shortcut_capture(&app, "command", None)
+}
+
+/// 录入收尾的唯一实现：正常 stop、启动回滚与 watchdog 共用。
+///
+/// `expected` 为 Some 时用原子 compare-exchange 认领当前代次；认领失败说明
+/// 已有新的 start/stop，直接返回、不得停掉新会话。正常 stop 传 None 总是认领。
+/// 清理动作本身幂等（`set_shortcut_capture_active(false)` / 恢复目标 / 恢复 IME
+/// 均可重复）。
+fn finish_shortcut_capture(
+    app: &tauri::AppHandle,
+    reason: &str,
+    expected: Option<u64>,
+) -> ShortcutCaptureStopResult {
+    if !claim_shortcut_capture_finish(expected) {
+        return ShortcutCaptureStopResult {
+            wetype_voice: "unknown",
+        };
+    }
+    if reason == "watchdog" {
+        sayall_windows::gatt_note(
+            "shortcut_capture action=watchdog phase=triggered reason=timeout".to_owned(),
+        );
+    }
     let mic_baseline = match capture_mic_baseline_slot().lock() {
         Ok(mut guard) => guard.take(),
         Err(poisoned) => poisoned.into_inner().take(),
     };
     let wetype_voice = sayall_windows::capture_mic_verdict(mic_baseline);
     let _ = sayall_windows::key_gate::set_shortcut_capture_active(false);
+    if let Some(state) = app.try_state::<AppState>() {
+        state.platform.set_shortcut_capture_suspension(false);
+    }
+    sayall_windows::gatt_note(format!(
+        "shortcut_capture action=suspend_enhanced_capture phase=requested suspended=false reason={reason}"
+    ));
     // 恢复录入前的输入区域布局（让位撤销，输入法回到该窗口会话）。
-    match run_ime_yield_on_window_thread(&app, sayall_windows::restore_input_method_after_capture) {
+    match run_ime_yield_on_window_thread(app, sayall_windows::restore_input_method_after_capture) {
         Some(note) => sayall_windows::gatt_note(note),
         None => sayall_windows::gatt_note(
             "capture_ime_restore outcome=unavailable reason=window_thread_timeout".to_owned(),
         ),
     }
     sayall_windows::gatt_note(format!(
-        "shortcut_capture action=stop phase=completed terminal_result=passed pending_key_ups=paired wetype_voice={wetype_voice} {}",
+        "shortcut_capture action=stop phase=completed terminal_result=passed reason={reason} pending_key_ups=paired wetype_voice={wetype_voice} {}",
         sayall_windows::key_gate::capture_diagnostics_summary()
     ));
     ShortcutCaptureStopResult { wetype_voice }
@@ -3649,24 +4037,69 @@ async fn get_voice_input_tool(
     result
 }
 
-#[tauri::command]
-async fn set_voice_input_tool(
+#[derive(Clone, Copy)]
+enum VoiceToolWriteAction {
+    /// 用户在连接页/向导里显式选择：允许一次 `tool_select` 对齐。
+    UserSelect,
+    /// 启动恢复 / 老配置推断：只恢复按下时兜底切换的目标，不做对齐。
+    Restore,
+}
+
+impl VoiceToolWriteAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UserSelect => "save",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+/// 按写入来源选择平台调用（纯函数，便于单测钉住 Issue #367 的契约）。
+///
+/// `UserSelect` 允许一次“选中即对齐”；`Restore` 只恢复按下语音键时的目标，
+/// **绝不能**落到 `set_voice_input_tool`，否则启动失焦会再次触发桌面级切换。
+fn apply_voice_tool_write(
+    action: VoiceToolWriteAction,
     tool: Option<VoiceInputTool>,
-    state: tauri::State<'_, AppState>,
+    set: impl FnOnce(Option<VoiceInputTool>),
+    restore: impl FnOnce(Option<VoiceInputTool>),
+) {
+    match action {
+        VoiceToolWriteAction::UserSelect => set(tool),
+        VoiceToolWriteAction::Restore => restore(tool),
+    }
+}
+
+/// 保存输入工具并把目标推给平台；`action` 决定是否允许“选中即对齐”。
+///
+/// 为什么必须分开（Issue #367）：`tool_select` 对齐最终使用
+/// `TF_IPPMF_FORSESSION`，官方语义是“Activate this profile for all threads in
+/// the current desktop”——会把任务栏、开始菜单、搜索及同桌面其他进程一起切走。
+/// 启动恢复或旧配置推断不是用户主动选择，只能恢复按下语音键时的兜底目标，
+/// 不能触发这次桌面级切换。
+async fn write_voice_input_tool(
+    tool: Option<VoiceInputTool>,
+    settings: SettingsStore,
+    platform: Arc<dyn PlatformRuntime>,
+    action: VoiceToolWriteAction,
 ) -> Result<Option<VoiceInputTool>, String> {
     let started = std::time::Instant::now();
-    let settings = state.settings.clone();
-    let platform = state.platform.clone();
     sayall_windows::gatt_note(format!(
-        "shortcut_settings feature=voice_input_tool action=save phase=requested tool={}",
+        "shortcut_settings feature=voice_input_tool action={} phase=requested tool={}",
+        action.label(),
         voice_input_tool_name(tool)
     ));
     let result = match tauri::async_runtime::spawn_blocking(move || {
         settings.save_voice_input_tool(tool)?;
-        // 推给平台：BLE 工作线程在按下语音键的那一刻按它决定切哪个输入法（按下时兜底切换），
-        // 并且在**选中的当下就尝试对齐**系统输入法（自身窗口在前台时改为布防，等失焦后切；
-        // 见 `sayall_windows::WindowsPlatform::set_voice_input_tool`，2026-10-03 Andy 要求）。
-        platform.set_voice_input_tool(tool);
+        apply_voice_tool_write(
+            action,
+            tool,
+            // 用户显式选择：保留 2026-10-03 的“选中即对齐”（自身窗口在前台时
+            // 布防，等失焦后再切）。
+            |tool| platform.set_voice_input_tool(tool),
+            // 启动恢复 / 旧配置推断：只恢复按下语音键时的兜底切换目标。
+            |tool| platform.restore_voice_input_tool(tool),
+        );
         Ok(tool)
     })
     .await
@@ -3676,17 +4109,49 @@ async fn set_voice_input_tool(
     };
     sayall_windows::gatt_note(match &result {
         Ok(saved) => format!(
-            "shortcut_settings feature=voice_input_tool action=save phase=completed terminal_result=passed tool={} elapsed_ms={}",
+            "shortcut_settings feature=voice_input_tool action={} phase=completed terminal_result=passed tool={} elapsed_ms={}",
+            action.label(),
             voice_input_tool_name(*saved),
             started.elapsed().as_millis()
         ),
         Err(_) => format!(
-            "shortcut_settings feature=voice_input_tool action=save phase=completed terminal_result=failed tool={} error_domain=settings error_code=save_failed reason=settings_save_failed retryable=true elapsed_ms={}",
+            "shortcut_settings feature=voice_input_tool action={} phase=completed terminal_result=failed tool={} error_domain=settings error_code=save_failed reason=settings_save_failed retryable=true elapsed_ms={}",
+            action.label(),
             voice_input_tool_name(tool),
             started.elapsed().as_millis()
         ),
     });
     result
+}
+
+/// 用户在连接页/向导里显式选择输入工具：保存并允许一次选中即对齐。
+#[tauri::command]
+async fn set_voice_input_tool(
+    tool: Option<VoiceInputTool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<VoiceInputTool>, String> {
+    write_voice_input_tool(
+        tool,
+        state.settings.clone(),
+        state.platform.clone(),
+        VoiceToolWriteAction::UserSelect,
+    )
+    .await
+}
+
+/// 启动恢复 / 老配置推断输入工具：保存推断值并恢复平台目标，但不触发对齐。
+#[tauri::command]
+async fn restore_voice_input_tool(
+    tool: Option<VoiceInputTool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<VoiceInputTool>, String> {
+    write_voice_input_tool(
+        tool,
+        state.settings.clone(),
+        state.platform.clone(),
+        VoiceToolWriteAction::Restore,
+    )
+    .await
 }
 
 /// 「锁定当前按键」偏好（按键页页脚开关，2026-10-18 持久化）。
@@ -3751,9 +4216,9 @@ async fn set_lock_mapping_selection(
 
 /// 「用户选的输入工具」的唯一来源（`settings.json`，与 `get_voice_input_tool` 同源）。
 ///
-/// 为什么不问平台：`PlatformRuntime` 只有 setter（`set_voice_input_tool`），没有
-/// getter；平台侧持有的那份本身也始终由 `settings.json` 写入（启动装载 + 每次保存），
-/// 读设置文件不会引入第二份真值。
+/// 为什么不问平台：`PlatformRuntime` 只有 setter（`set_voice_input_tool` /
+/// `restore_voice_input_tool`），没有 getter；平台侧持有的那份本身也始终由
+/// `settings.json` 写入（启动装载 + 每次保存），读设置文件不会引入第二份真值。
 fn load_voice_input_tool(settings: &SettingsStore) -> Option<VoiceInputTool> {
     settings
         .load()
@@ -3881,10 +4346,12 @@ async fn complete_onboarding(
     }
 }
 
-/// 第④步暂存语音绑定：落回滚快照 + 应用正式配置，并把工具/快捷键推给平台。
+/// 第⑤步暂存语音绑定：落回滚快照 + 应用正式配置，并把工具/快捷键推给平台。
 ///
-/// 平台应用与 `set_voice_input_tool` / `set_voice_hold_hotkey` 同一条链路：
-/// 保证第⑤步真实验证时按下语音键就能按 staged 组合触发。
+/// 平台应用与 `restore_voice_input_tool` / `set_voice_hold_hotkey` 同一条链路：
+/// 保证第⑤步真实验证时按下语音键就能按 staged 组合触发。这里**不做选中即对齐**
+/// ——向导第⑤步是只读检查 + 文字提醒（2026-10-13 定稿）；对齐会切换整个桌面的
+/// 输入法（Issue #367）。
 #[tauri::command]
 async fn stage_onboarding_voice_binding(
     tool: VoiceInputTool,
@@ -3895,7 +4362,7 @@ async fn stage_onboarding_voice_binding(
     let platform = state.platform.clone();
     match tauri::async_runtime::spawn_blocking(move || {
         let staged = settings.stage_onboarding_voice_binding(tool, hotkey.clone())?;
-        platform.set_voice_input_tool(Some(tool));
+        platform.restore_voice_input_tool(Some(tool));
         platform.set_voice_hold_hotkey(hotkey);
         Ok::<_, String>(staged)
     })
@@ -3959,6 +4426,77 @@ fn transcript_audio_enabled(state: &AppState) -> bool {
             false
         }
     }
+}
+
+// ---- 回眸「本地 Agent 访问」 ----
+
+#[tauri::command]
+fn get_agent_access_snapshot(
+    state: tauri::State<'_, AppState>,
+) -> agent_access::AgentAccessSnapshot {
+    state.agent_access.snapshot()
+}
+
+#[tauri::command]
+async fn set_agent_access_enabled(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<agent_access::AgentAccessSnapshot, agent_access::AgentAccessCommandError> {
+    let store = Arc::clone(&state.agent_access);
+    tauri::async_runtime::spawn_blocking(move || store.set_enabled(enabled))
+        .await
+        .map_err(|_| agent_access::AgentAccessCommandError::new("access_update_failed"))?
+}
+
+#[tauri::command]
+async fn create_agent_authorization(
+    display_name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<agent_access::CreatedAgentAuthorization, agent_access::AgentAccessCommandError> {
+    let store = Arc::clone(&state.agent_access);
+    tauri::async_runtime::spawn_blocking(move || store.create_manual(&display_name))
+        .await
+        .map_err(|_| agent_access::AgentAccessCommandError::new("authorization_failed"))?
+}
+
+#[tauri::command]
+async fn revoke_agent_authorization(
+    client_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<agent_access::AgentAccessSnapshot, agent_access::AgentAccessCommandError> {
+    let store = Arc::clone(&state.agent_access);
+    tauri::async_runtime::spawn_blocking(move || store.revoke(&client_id))
+        .await
+        .map_err(|_| agent_access::AgentAccessCommandError::new("revoke_failed"))?
+}
+
+#[tauri::command]
+async fn connect_agent_client(
+    client: agent_access::AgentClientId,
+    state: tauri::State<'_, AppState>,
+) -> Result<agent_access::AgentAccessSnapshot, agent_access::AgentAccessCommandError> {
+    let store = Arc::clone(&state.agent_access);
+    tauri::async_runtime::spawn_blocking(move || store.connect(client))
+        .await
+        .map_err(|_| {
+            agent_access::AgentAccessCommandError::for_client("integration_failed", client)
+        })?
+}
+
+#[tauri::command]
+async fn remove_agent_client(
+    client: agent_access::AgentClientId,
+    state: tauri::State<'_, AppState>,
+) -> Result<agent_access::AgentAccessSnapshot, agent_access::AgentAccessCommandError> {
+    let store = Arc::clone(&state.agent_access);
+    tauri::async_runtime::spawn_blocking(move || store.disconnect(client))
+        .await
+        .map_err(|_| {
+            agent_access::AgentAccessCommandError::for_client(
+                "configuration_removal_failed",
+                client,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -5325,6 +5863,20 @@ pub fn run() {
             sayall_windows::gatt_note(
                 "app_lifecycle event=tauri_setup phase=started result=passed".to_owned(),
             );
+            // tauri.conf 的窗口尺寸在部分高 DPI 会话里按创建时 DPI 解释，可能落到
+            // 540×404 逻辑像素。这里显式按逻辑像素设一次默认尺寸与最小尺寸，
+            // 保证 1066×800 的设计窗口在各缩放比例下一致。
+            if let Some(window) = main_window(app.handle()) {
+                let _ = window.set_min_size(Some(tauri::LogicalSize::new(
+                    MAIN_WINDOW_MIN_WIDTH,
+                    MAIN_WINDOW_MIN_HEIGHT,
+                )));
+                let _ = window.set_size(tauri::LogicalSize::new(
+                    MAIN_WINDOW_MIN_WIDTH,
+                    MAIN_WINDOW_DEFAULT_HEIGHT,
+                ));
+                let _ = window.center();
+            }
             // 常用语浮层窗口（可选私有组件）：窗口先建好并隐藏；组件未注入时能力不可用。
             let common_phrases_available = common_phrase_panel::install(app.handle());
             sayall_windows::gatt_note(format!(
@@ -5792,16 +6344,19 @@ pub fn run() {
             }
 
             // 选的输入工具同样要推给平台（2026-10-01）：语音会话开始前决定把哪个
-            // 输入法切进当前会话。启动恢复同样走"选中即对齐"（2026-10-03 Andy：
-            // 保证重启/冷启动后的第一按也能拉起）：自身在前台先布防、失焦后切一次；
-            // 否则立即切。基准确认见 Bugs/2026-10-03-ime-switch-lags-tool-selection.md。
+            // 输入法切进当前会话。
+            //
+            // 启动恢复**不做**“选中即对齐”（Issue #367）：对齐最终使用
+            // `TF_IPPMF_FORSESSION`，会切换当前桌面的所有线程（任务栏、开始菜单、
+            // 搜索及同桌面其他进程）；开机后用户还没按语音键就把默认输入法切走，
+            // 是不可接受的副作用。这里只恢复按下语音键时的兜底目标。
             match settings.load() {
                 Ok(loaded) => {
                     sayall_windows::gatt_note(format!(
                         "shortcut_settings feature=voice_input_tool action=restore phase=completed terminal_result=passed tool={}",
                         voice_input_tool_name(loaded.voice_input_tool)
                     ));
-                    platform.set_voice_input_tool(loaded.voice_input_tool);
+                    platform.restore_voice_input_tool(loaded.voice_input_tool);
                 }
                 Err(error) => {
                     sayall_windows::gatt_note(
@@ -5874,6 +6429,22 @@ pub fn run() {
                     .join("v1")
             });
             let transcript_store = Arc::new(transcripts::TranscriptStore::new(transcript_root));
+            // 本地 Agent 访问：授权状态独立于 settings.json（安装生命周期会哈希断言设置文件）。
+            let agent_access_root =
+                agent_access::AgentAccessStore::default_root().unwrap_or_else(|_| {
+                    sayall_windows::gatt_note(
+                        "agent_access action=resolve_root phase=completed result=fallback reason=localappdata_unavailable"
+                            .to_owned(),
+                    );
+                    app.path()
+                        .app_local_data_dir()
+                        .unwrap_or_else(|_| std::env::temp_dir())
+                        .join("SayAll")
+                        .join("mcp")
+                        .join("v1")
+                });
+            let agent_access_store =
+                Arc::new(agent_access::AgentAccessStore::new(agent_access_root));
             let capture_store = Arc::clone(&transcript_store);
             let capture_app = app.handle().clone();
             platform.set_transcript_capture_sink(Arc::new(
@@ -5962,6 +6533,7 @@ pub fn run() {
                     completed_update.then(|| app.package_info().version.to_string()),
                 ),
                 transcripts: transcript_store,
+                agent_access: agent_access_store,
             });
             app.manage(recommendations::RecommendationsState::default());
             // 按键宿主进程（切片 1：骨架/握手/生命周期；钩子迁移见后续切片）：
@@ -5970,6 +6542,7 @@ pub fn run() {
             #[cfg(windows)]
             if let Some(window) = main_window(app.handle()) {
                 install_window_key_subclass(&window);
+                install_window_min_size_subclass(&window);
             }
             #[cfg(windows)]
             if let Some(webview) = main_webview(app.handle()) {
@@ -5995,6 +6568,46 @@ pub fn run() {
                     }
                 });
             }
+            // "打开别的应用"前把自身主窗口退出置顶。自身若带 `WS_EX_TOPMOST`，
+            // 前台焦点虽然切给了目标，Z 序上却永远压着它——日志 `foreground_observed`
+            // 全绿、用户只看到无线麦（2026-11-05 现场）。产品从未主动置顶主窗口，
+            // 该样式来自外部工具或历史状态，所以这里不追来源，直接按结果兜底。
+            {
+                let handle = app.handle().clone();
+                sayall_windows::app_launcher::set_self_drop_topmost(move || {
+                    let Some(window) = main_window(&handle) else {
+                        return false;
+                    };
+                    let Ok(hwnd) = window.hwnd() else {
+                        return false;
+                    };
+                    // 先读 Win32 样式：绝大多数窗口本来就没置顶，这里零开销地
+                    // 返回 false，不产生任何跨线程 dispatch（本回调可能来自引擎线程、
+                    // 主线程或 Tauri 窗口事件；一次按键可能被多个候选窗口各调一次）。
+                    let dropped =
+                        sayall_windows::app_launcher::drop_window_topmost(hwnd.0 as isize);
+                    if dropped {
+                        // 样式已清，同步让 tao 的 `ALWAYS_ON_TOP` flag 归零：否则它
+                        // 下一次 `set_window_flags`（show/hide/聚焦都会走）会按旧 flag
+                        // 把 `WS_EX_TOPMOST` 再 OR 回来，撤顶变成一次性的。
+                        let _ = window.set_always_on_top(false);
+                        sayall_windows::gatt_note(
+                            "app_launcher action=drop_self_topmost terminal_result=passed"
+                                .to_owned(),
+                        );
+                    }
+                    dropped
+                });
+            }
+            // 启动时主动撤掉历史遗留的置顶位：主窗口带 `WS_EX_TOPMOST` 时，
+            // Alt+Tab 切走后焦点虽已给目标，Z 序上仍压着它（2026-11-19 反馈
+            // 「上一个应用是无线麦时连按两下卡死」）。打开应用的入口只在
+            // `activate_or_launch` 撤顶，覆盖不到启动即带置顶位的旧状态。
+            let startup_topmost_dropped =
+                sayall_windows::app_launcher::request_self_drop_topmost();
+            sayall_windows::gatt_note(format!(
+                "window_topmost_guard reason=startup dropped={startup_topmost_dropped} terminal_result=passed"
+            ));
             sayall_windows::gatt_note(
                 "app_lifecycle event=tauri_setup phase=completed terminal_result=passed window_created=true state_managed=true".to_owned(),
             );
@@ -6034,6 +6647,17 @@ pub fn run() {
                 // Bugs/2026-09-12）时，这里在焦点离开后再切一次，让后续语音键按下时
                 // 系统输入法已对齐。未布防时是 no-op。
                 if window.label() == "main" {
+                    // Alt+Tab / Win+D 切走时先撤顶：若主窗口带 `WS_EX_TOPMOST`，
+                    // 焦点虽已切给目标，Z 序上仍会把它压在下面，表现为“切不过去/
+                    // 卡死”（2026-11-19 反馈：上一个应用是无线麦时连按两下）。
+                    // 启动入口只能清历史状态；这里覆盖运行期间被外部工具重新置顶。
+                    let dropped = sayall_windows::app_launcher::request_self_drop_topmost();
+                    if dropped {
+                        sayall_windows::gatt_note(
+                            "window_topmost_guard reason=focus_lost dropped=true terminal_result=passed"
+                                .to_owned(),
+                        );
+                    }
                     if let Some(state) = window.app_handle().try_state::<AppState>() {
                         state.platform.align_ime_after_tool_selection();
                     }
@@ -6079,6 +6703,7 @@ pub fn run() {
         open_log_directory,
         open_windows_settings,
         hide_main_window,
+        hide_main_window_from_title_bar,
         show_recommendations,
         retry_recommendations,
         hide_recommendations,
@@ -6131,8 +6756,12 @@ pub fn run() {
         common_phrase_panel::select_common_phrase,
         common_phrase_panel::common_phrase_dispatch,
         test_app_focus,
+        learn_scroll_region,
+        test_scroll_region,
         activate_app_for_learning,
         list_preset_apps,
+        resolve_preset_target,
+        get_application_icon,
         pick_custom_app,
         scan_registered_apps,
         get_button_mapping_snapshot,
@@ -6143,11 +6772,18 @@ pub fn run() {
         set_voice_hold_hotkey,
         get_voice_input_tool,
         set_voice_input_tool,
+        restore_voice_input_tool,
         get_lock_mapping_selection,
         set_lock_mapping_selection,
         get_ime_status,
         get_gain_db,
         set_gain_db,
+        get_agent_access_snapshot,
+        set_agent_access_enabled,
+        create_agent_authorization,
+        revoke_agent_authorization,
+        connect_agent_client,
+        remove_agent_client,
         get_transcript_history,
         set_transcript_history_enabled,
         set_transcript_audio_recording_enabled,
@@ -6218,6 +6854,7 @@ pub fn run() {
         open_log_directory,
         open_windows_settings,
         hide_main_window,
+        hide_main_window_from_title_bar,
         show_recommendations,
         retry_recommendations,
         hide_recommendations,
@@ -6270,8 +6907,12 @@ pub fn run() {
         common_phrase_panel::select_common_phrase,
         common_phrase_panel::common_phrase_dispatch,
         test_app_focus,
+        learn_scroll_region,
+        test_scroll_region,
         activate_app_for_learning,
         list_preset_apps,
+        resolve_preset_target,
+        get_application_icon,
         pick_custom_app,
         scan_registered_apps,
         get_button_mapping_snapshot,
@@ -6282,11 +6923,18 @@ pub fn run() {
         set_voice_hold_hotkey,
         get_voice_input_tool,
         set_voice_input_tool,
+        restore_voice_input_tool,
         get_lock_mapping_selection,
         set_lock_mapping_selection,
         get_ime_status,
         get_gain_db,
         set_gain_db,
+        get_agent_access_snapshot,
+        set_agent_access_enabled,
+        create_agent_authorization,
+        revoke_agent_authorization,
+        connect_agent_client,
+        remove_agent_client,
         get_transcript_history,
         set_transcript_history_enabled,
         set_transcript_audio_recording_enabled,
@@ -6350,6 +6998,81 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 扫描失败日志只落稳定分类 token，方便现场按 `error_code` 归因。
+    #[test]
+    fn scan_error_codes_are_stable_tokens() {
+        assert_eq!(
+            scan_error_code(&sayall_windows::PlatformError::UnsupportedPlatform),
+            "unsupported_platform"
+        );
+        assert_eq!(
+            scan_error_code(&sayall_windows::PlatformError::WindowsApi("x".into())),
+            "windows_api"
+        );
+        assert_eq!(
+            scan_error_code(&sayall_windows::PlatformError::OperationTimedOut),
+            "operation_timed_out"
+        );
+        assert_eq!(
+            scan_error_code(&sayall_windows::PlatformError::Gatt("x".into())),
+            "platform"
+        );
+    }
+
+    /// Issue #367 的回归锁：启动恢复/旧配置推断走 `Restore` 时，绝不能调用
+    /// `set_voice_input_tool`（后者会布防 `tool_select`，失焦后用
+    /// `TF_IPPMF_FORSESSION` 切换整个桌面）。用两个回调直接钉住分发，
+    /// 不依赖 Tauri 运行时或真实 TSF。
+    #[test]
+    fn restoring_voice_tool_write_never_uses_the_alignment_setter() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        apply_voice_tool_write(
+            VoiceToolWriteAction::Restore,
+            Some(VoiceInputTool::Wechat),
+            |_| calls.borrow_mut().push("set"),
+            |tool| {
+                calls.borrow_mut().push(match tool {
+                    Some(VoiceInputTool::Wechat) => "restore:wechat",
+                    _ => "restore:other",
+                });
+            },
+        );
+        assert_eq!(*calls.borrow(), vec!["restore:wechat"]);
+    }
+
+    /// 反向锁：用户显式选择工具时仍必须走 `set`，保留 2026-10-03 的
+    /// “选中即对齐”（Issue #367 只禁止启动/推断路径触发）。
+    #[test]
+    fn user_selection_voice_tool_write_still_uses_the_alignment_setter() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        apply_voice_tool_write(
+            VoiceToolWriteAction::UserSelect,
+            Some(VoiceInputTool::Doubao),
+            |tool| {
+                calls.borrow_mut().push(match tool {
+                    Some(VoiceInputTool::Doubao) => "set:doubao",
+                    _ => "set:other",
+                });
+            },
+            |_| calls.borrow_mut().push("restore"),
+        );
+        assert_eq!(*calls.borrow(), vec!["set:doubao"]);
+    }
+
+    /// 手动回归（2026-11-10 用户现场）：程序选择返回的 `.lnk` 也必须能拿到 Shell 图标。
+    /// 运行：
+    ///   $env:SAYALL_TEST_SHORTCUT_PATH='C:\...\shortcut.lnk'
+    ///   cargo test -p sayall-windows-app application_icon_from_shortcut -- --ignored
+    #[test]
+    #[ignore]
+    fn application_icon_from_shortcut_returns_data_url() {
+        let path = std::env::var("SAYALL_TEST_SHORTCUT_PATH")
+            .expect("set SAYALL_TEST_SHORTCUT_PATH to a real .lnk");
+        let icon = get_application_icon(path).expect("shortcut icon should be extracted");
+        assert!(icon.starts_with("data:image/png;base64,"));
+        assert!(icon.len() > 1000);
+    }
 
     /// 安装器钩子源码。契约测试要在**构建期**读它：这些断言存在的理由就是
     /// "有人改了一侧、忘了另一侧"（2026-09-16 的僵死 Bug 正是文档写了规则、
@@ -7072,6 +7795,31 @@ mod tests {
         }
     }
 
+    /// 2026-11-14 用户现场：升级 1.9.2 时 `sayall-mcp.exe` 被 Codex/Claude Code
+    /// 持有的 MCP 服务锁住，安装器停在“无法打开要写入的文件”。MCP 不在主程序
+    /// 退出链路内，必须在覆盖文件前单独结束；安装和卸载两条路径都要做。
+    /// 这里只守护静态契约，真实现场由安装器测试/真机验收覆盖。
+    #[test]
+    fn installer_stops_mcp_server_before_overwriting_its_image() {
+        let stop = macro_body(INSTALLER_HOOKS, "SayAllStopMcp");
+        for token in ["FindProcessCurrentUser", "taskkill", "SAYALL_MCP_IMAGE"] {
+            assert!(stop.contains(token), "MCP 停止宏缺少 `{token}`");
+        }
+        assert!(
+            stop.contains("Abort"),
+            "MCP 进程在预算内未退出时必须中止安装，不能继续撞文件锁"
+        );
+        for (hook, expected) in [
+            ("NSIS_HOOK_PREINSTALL", "SayAllStopMcp install 1"),
+            ("NSIS_HOOK_PREUNINSTALL", "SayAllStopMcp uninstall 0"),
+        ] {
+            assert!(
+                macro_body(INSTALLER_HOOKS, hook).contains(&format!("!insertmacro {expected}")),
+                "`{hook}` 没有在覆盖 sayall-mcp.exe 前停止 MCP 服务"
+            );
+        }
+    }
+
     /// 2026-10-08 产品决定（用户明确）：**卸载不再弹窗**——删不掉的东西由提权助手先做
     /// 设备环释放锁、再删，仍删不掉的一律安排到重启后自动删除。这条断言防止有人
     /// 再把"未能立即删除"的提示加回来。
@@ -7385,9 +8133,16 @@ mod tests {
 
     /// 安装器钩子**不得**自己引入强杀。Tauri 模板在钩子之后跑
     /// `CheckIfAppIsRunning`；只要应用已退出，那一步自然落空。
+    ///
+    /// 唯一例外是独立的只读 MCP 服务：它不持有 BLE、音频或按键会话，且不在
+    /// 主程序退出链路内（2026-11-14 升级现场）。该例外必须**只存在于**
+    /// `SayAllStopMcp` 宏中；宏外出现任何强杀仍按原规则失败。
     #[test]
     fn installer_hook_never_force_kills_the_app() {
-        let code = strip_comments(INSTALLER_HOOKS).to_ascii_lowercase();
+        let mcp_stop = strip_comments(&macro_body(INSTALLER_HOOKS, "SayAllStopMcp"));
+        let code = strip_comments(INSTALLER_HOOKS)
+            .replace(&mcp_stop, "")
+            .to_ascii_lowercase();
         for token in [
             "killprocess",
             "terminateprocess",
@@ -7396,7 +8151,7 @@ mod tests {
         ] {
             assert!(
                 !code.contains(token),
-                "安装器钩子出现强杀 `{token}`：强杀会留下未关闭的 GATT 会话并楔死系统蓝牙栈"
+                "安装器钩子在 MCP 宏之外出现强杀 `{token}`：强杀会留下未关闭的 GATT 会话并楔死系统蓝牙栈"
             );
         }
     }
@@ -7569,6 +8324,38 @@ mod ui_hint_tests {
     /// 需要查**非主窗口**的 webview 窗口，请把断言收窄到只禁 `main` 参数，并在
     /// 评审里说明理由。
     #[test]
+    fn shortcut_capture_suspends_and_restores_enhanced_capture() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn start_shortcut_capture(")
+            .expect("start_shortcut_capture must exist");
+        let stop = source
+            .find("fn stop_shortcut_capture(")
+            .expect("stop_shortcut_capture must exist");
+        let start_block = &source[start..stop];
+        assert!(
+            start_block.contains("set_shortcut_capture_suspension(true)"),
+            "start must suspend enhanced capture before arming the hook"
+        );
+        assert!(
+            start_block.contains("set_shortcut_capture_suspension(false)"),
+            "start failure path must roll the suspension back"
+        );
+        assert!(
+            source[stop..].contains("set_shortcut_capture_suspension(false)"),
+            "stop must restore enhanced capture"
+        );
+    }
+
+    #[test]
+    fn shortcut_capture_finish_claim_rejects_stale_generation() {
+        let base = SHORTCUT_CAPTURE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+        assert!(claim_shortcut_capture_finish(Some(base)));
+        assert!(!claim_shortcut_capture_finish(Some(base)));
+        assert!(claim_shortcut_capture_finish(None));
+    }
+
+    #[test]
     fn main_window_lookup_never_uses_the_webview_window_api() {
         let api = concat!("get_webview_window", "(");
         for (path, source) in [
@@ -7581,5 +8368,39 @@ mod ui_hint_tests {
                  请改用 main_window(app) / main_webview(app)"
             );
         }
+    }
+
+    /// 主窗口若带 `WS_EX_TOPMOST`，Alt+Tab 切走后会把目标应用压在下面
+    /// （2026-11-19 反馈：上一个应用是无线麦时“点两下卡死”）。
+    ///
+    /// 启动时与主窗口失焦时必须主动撤顶；这里用源码契约锁住两个入口，
+    /// 防止后续重构只保留“打开应用”前的那次调用。
+    #[test]
+    fn stale_topmost_is_dropped_at_startup_and_on_main_focus_loss() {
+        let source = include_str!("lib.rs");
+
+        let focus_start = source
+            .find("WindowEvent::Focused(false)")
+            .expect("Focused(false) 分支必须存在");
+        let focus_end = source[focus_start..]
+            .find("WindowEvent::Resized")
+            .map(|offset| focus_start + offset)
+            .expect("Focused(false) 分支后必须有 Resized 分支");
+        assert!(
+            source[focus_start..focus_end].contains("request_self_drop_topmost()"),
+            "主窗口失焦时必须撤掉自身置顶位，否则 Alt+Tab 切走后目标应用会被压在下面"
+        );
+
+        let setup_start = source
+            .find("set_self_drop_topmost")
+            .expect("启动时必须注册撤顶回调");
+        let setup_end = source[setup_start..]
+            .find("app_lifecycle event=tauri_setup")
+            .map(|offset| setup_start + offset)
+            .expect("注册撤顶回调后必须有 setup 完成日志");
+        assert!(
+            source[setup_start..setup_end].contains("request_self_drop_topmost()"),
+            "启动时必须主动撤掉历史遗留的置顶位"
+        );
     }
 }

@@ -4,7 +4,6 @@ import {
   disconnectRemote,
   getAudioSnapshot,
   getButtonMappings,
-  getAppIcon,
   getDiagnosticReport,
   getGainDb,
   getOpenWindowAtLaunch,
@@ -319,13 +318,23 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   );
   steps.push("「聚焦输入框」入口可见，动作经真实 IPC 写入并分发到平台聚焦受理");
 
-  // 「打开应用 + 聚焦方式」：面板于 2026-10-15 按用户要求恢复（与 Mac 对齐，见
-  // src/pages/ButtonsPage.vue 同款注释）。这里钉住面板可见；学习与测试两条路径仍经
-  // 真实 IPC 覆盖。
-  await clickButton("打开记事本");
-  await waitFor(
-    () => (document.querySelector(".focus-profile") ? true : null),
-    "「聚焦方式」面板可见",
+  // 「打开 APP」：预设应用自带聚焦与翻页，按键页不再显示聚焦配置摘要；自定义
+  // 应用才显示摘要并进入 APP 适配页配置。学习与测试两条路径仍经真实 IPC 覆盖。
+  // 只点编辑器内的应用 chip，避免命中背景里同名的映射格（后者不会应用动作）。
+  const appChip = await waitFor(
+    () =>
+      Array.from(
+        document.querySelectorAll<HTMLButtonElement>(".mapping-editor button.chip"),
+      ).find(
+        (button) => button.textContent?.trim() === "打开记事本" && !button.disabled,
+      ) ?? null,
+    "编辑器的「打开记事本」应用按钮",
+  );
+  appChip.click();
+  await new Promise((resolve) => window.setTimeout(resolve, 100));
+  assert(
+    document.querySelector(".focus-profile-summary") === null,
+    "预设应用不应显示聚焦配置摘要",
   );
   const learned = await learnFocusTarget();
   assert(
@@ -333,12 +342,37 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
     "仿真学习样本不是预期的可编辑目标",
   );
   await testAppFocus("notepad");
-  steps.push("「聚焦方式」面板可见；学习与测试打开聚焦经真实 IPC 覆盖");
+  steps.push("预设应用不显示聚焦配置；学习与测试打开聚焦经真实 IPC 覆盖");
 
-  mark("permissions_page");
-  await openPage("权限");
-  // 诊断摘要 2026-10-01 从关于页迁回权限页（用户指定）：状态与取证入口同页，
-  // 用户看到某一项不对时不必跳页。
+  await openPage("设置");
+  mark("settings_page");
+  // 2026-10-02 设置页改版（对齐 Mac 新设置页）：顶部模块 = 应用标识 + 版本 +
+  // 检查更新；各分组在卡外有分组标题。2026-10-08 起多一个「首次设置」分组
+  // （向导重跑入口，随首次设置向导一起交付）。2026-10-31 权限页并入设置：
+  // 权限、诊断摘要、日志目录与问题反馈都在本页，侧栏不再有独立「权限」入口。
+  const settingsOverview = document.querySelector<HTMLElement>("article.settings-overview");
+  assert(settingsOverview !== null, "设置页缺少顶部标识与检查更新模块");
+  assert(
+    settingsOverview.textContent?.includes("当前版本") === true,
+    "设置页顶部没有显示当前版本",
+  );
+  assert(
+    document.querySelector("article.settings-overview .check-button") !== null,
+    "设置页顶部没有检查更新入口",
+  );
+  const sectionTitles = Array.from(
+    document.querySelectorAll<HTMLElement>(".settings-section .section-title"),
+  ).map((element) => element.textContent?.trim());
+  assert(
+    sectionTitles.join(" / ") === "权限 / 通用 / 首次设置 / 诊断与日志",
+    `设置页分组标题异常：${sectionTitles.join(" / ")}`,
+  );
+  const permissionRows = document.querySelectorAll(".permission-row");
+  assert(permissionRows.length === 3, "设置页权限分组没有蓝牙/按键/音频三项状态");
+  steps.push("设置页按「权限 / 通用 / 首次设置 / 诊断与日志」分组呈现");
+
+  // 诊断摘要 2026-10-31 从侧栏「权限」页并入设置页「诊断与日志」分组：
+  // 状态与取证入口同页，用户看到某一项不对时不必跳页。
   await clickButton("生成摘要");
   await waitFor(
     () =>
@@ -352,7 +386,7 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   assert(diagnostic.capabilities.bleVoiceReady, "诊断摘要没有反映 ATVV 就绪");
   assert(diagnostic.capabilities.wasapiReady, "诊断摘要没有反映 WASAPI 就绪");
   assert(diagnostic.capabilities.rawInputReady, "诊断摘要没有反映 Raw Input 就绪");
-  steps.push("权限页呈现蓝牙/按键/音频三项状态并生成去标识化运行诊断摘要");
+  steps.push("设置页权限分组呈现三项状态，诊断与日志分组生成去标识化运行诊断摘要");
 
   // "打开日志目录"刻意**不作成败断言**：它经 ShellExecuteW 交给资源管理器，
   // CI runner 是否有可用的 shell 桌面不在本仓库控制范围内，拿它当门禁只会
@@ -368,44 +402,22 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   );
   steps.push(
     logDirectoryMessage.startsWith("已打开日志目录")
-      ? "权限页“打开日志目录”经真实 IPC 交由资源管理器打开"
-      : `权限页“打开日志目录”返回不可用（deferred）：${logDirectoryMessage}`,
+      ? "设置页“打开日志目录”经真实 IPC 交由资源管理器打开"
+      : `设置页“打开日志目录”返回不可用（deferred）：${logDirectoryMessage}`,
   );
 
-  await openPage("设置");
-  mark("settings_page");
-  // 2026-10-02 设置页改版（对齐 Mac 新设置页）：顶部模块 = 应用标识 + 版本 +
-  // 检查更新；各分组在卡外有分组标题。2026-10-08 起多一个「首次设置」分组
-  // （向导重跑入口，随首次设置向导一起交付）。
-  const settingsOverview = document.querySelector<HTMLElement>("article.settings-overview");
-  assert(settingsOverview !== null, "设置页缺少顶部标识与检查更新模块");
-  assert(
-    settingsOverview.textContent?.includes("当前版本") === true,
-    "设置页顶部没有显示当前版本",
-  );
-  assert(
-    document.querySelector("article.settings-overview .check-button") !== null,
-    "设置页顶部没有检查更新入口",
-  );
-  const sectionTitles = Array.from(
-    document.querySelectorAll<HTMLElement>(".settings-section .section-title"),
-  ).map((element) => element.textContent?.trim());
-  assert(
-    sectionTitles.join(" / ") === "通用 / 首次设置 / 问题反馈",
-    `设置页分组标题异常：${sectionTitles.join(" / ")}`,
-  );
   const wizardEntry = Array.from(
     document.querySelectorAll<HTMLButtonElement>(".settings-section .settings-row button"),
   ).find((button) => button.textContent?.trim() === "重新运行向导");
   assert(wizardEntry !== null, "设置页缺少「重新运行向导」入口");
   const entryLabels = Array.from(
-    document.querySelectorAll<HTMLButtonElement>(".settings-section .button-row button"),
+    document.querySelectorAll<HTMLButtonElement>(".feedback-card .button-row button"),
   ).map((button) => button.textContent?.trim());
   assert(
     entryLabels.length === 2 && entryLabels[0] === "官网" && entryLabels[1] === "GitHub",
     `设置页问题反馈入口异常：${entryLabels.join(" / ")}`,
   );
-  steps.push("设置页顶部为应用标识/版本/检查更新，含「重新运行向导」入口与问题反馈（官网/GitHub）");
+  steps.push("设置页含「重新运行向导」入口，问题反馈与诊断摘要同属「诊断与日志」分组");
   await recordExternalEntry("官网", steps, simulationOptions.skipExternalEntries);
   await recordExternalEntry("GitHub", steps, simulationOptions.skipExternalEntries);
 
@@ -505,9 +517,24 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   );
   steps.push("设置页「启动时自动打开主面板」新装默认开启，切换经真实 IPC 与设置持久化往返");
 
-  await openPage("个人中心");
+  await openPage("我的", "个人中心");
   mark("profile_page");
-  assert(document.querySelector(".sidebar-footer") === null, "侧栏不应再显示版本号");
+  const titleBar = document.querySelector(".window-titlebar");
+  assert(titleBar !== null, "缺少自定义标题栏");
+  assert((titleBar.textContent ?? "").trim() === "", "标题栏不应显示 logo 或文字");
+  assert(
+    titleBar.querySelector("[data-tauri-drag-region]") !== null,
+    "标题栏缺少拖拽区",
+  );
+  assert(
+    document.querySelectorAll(".window-control").length === 3,
+    "标题栏窗口按钮不是 3 枚",
+  );
+  assert(
+    document.querySelector(".brand-version")?.textContent?.trim(),
+    "侧栏品牌区应显示版本号（对齐 Mac PR 803）",
+  );
+  assert(document.querySelector(".sidebar-footer") === null, "侧栏不应再有底部版本区");
   assert(
     document.querySelector(".share-nav-item") === null,
     "分享入口应在个人中心页内，不应出现在侧栏",
@@ -525,15 +552,10 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
     document.querySelector(".profile-header .badge")?.tagName === "SPAN",
     "数据仅存本机必须是文字，不能是可点击按钮",
   );
-  const currentAppIcon = await getAppIcon();
-  const expectedLogo =
-    currentAppIcon === "standard" ? "/app-logo.webp" : "/app-icon-faceted-duck.webp";
-  await waitFor(
-    () =>
-      document.querySelector(".profile-nav-item img")?.getAttribute("src") === expectedLogo
-        ? true
-        : null,
-    "个人中心侧栏入口使用当前应用 logo",
+  const profileIconPaths = document.querySelectorAll(".profile-nav-item svg path");
+  assert(
+    profileIconPaths.length === 3,
+    "账号入口应使用 person.crop.circle 图标，而不是应用 logo",
   );
   assert(document.querySelectorAll(".profile-kpi").length === 4, "个人中心 KPI 不是 4 项");
   const sharePanel = document.querySelector(".share-panel");
@@ -552,6 +574,12 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
       "分享无线麦 SayAll",
     "分享面板标题异常",
   );
+  // 个人中心页外壳先挂载，日历数据要等 IPC 快照回来才出现；直接断言会把
+  // 「数据还没到」误判成「日历没渲染」。
+  await waitFor(() => {
+    const days = document.querySelectorAll(".calendar-grid .calendar-day").length;
+    return days >= 7 ? days : null;
+  }, "个人中心日历渲染");
   assert(
     document.querySelectorAll(".calendar-grid .calendar-day").length >= 7,
     "个人中心日历没有渲染完整星期行",
